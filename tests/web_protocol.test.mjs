@@ -1,20 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  A5, CRC_SEED, P1, a5PrintChunkSize, buildA5PrintDataPayload, crc32, hex,
+  A5, CRC_SEED, P1, P1_SESSION_CRC_KEY, a5PrintChunkSize, buildA5PrintDataPayload, crc32, hex,
   A5StreamParser, buildHandshakeNoParamsRequest, buildHandshakeRequest, buildSystemRequest, parseA5Payload, parseTlvArgs,
   packA5Frame, packP1Frame, parseA5Frame, p1RegistrationFrame,
 } from '../web/src/protocol.js';
 import { packBinaryPixels, thresholdPixels } from '../web/src/raster.js';
 
-test('CRC32 matches Paperang fixed registration packet', () => {
+test('P1 CRC registration matches public Paperang session-key implementation', () => {
   assert.equal(CRC_SEED, 0x35769521);
-  assert.equal(crc32(Uint8Array.from([0x21,0x95,0x76,0x35])), 0x2144df1c);
-  assert.equal(hex(p1RegistrationFrame()), '0218000400219576351cdf442103');
+  assert.equal(P1_SESSION_CRC_KEY, 0x06b8ef59);
+  assert.equal(hex(p1RegistrationFrame()), '0218000400787ace332c8980f003');
+  assert.equal(hex(packP1Frame(P1.SET_DENSITY, Uint8Array.from([75]), 0, P1_SESSION_CRC_KEY)), '02190001004b2a26bd2103');
 });
 
 test('P1 frame encodes command/index/LE length/payload/CRC/tail', () => {
-  const frame = packP1Frame(P1.SET_DENSITY, Uint8Array.from([75]), 3);
+  const frame = packP1Frame(P1.SET_DENSITY, Uint8Array.from([75]), 3, P1_SESSION_CRC_KEY);
   assert.equal(frame[0], 0x02); assert.equal(frame[1], 0x19); assert.equal(frame[2], 3);
   assert.equal(frame[3], 1); assert.equal(frame[4], 0); assert.equal(frame.at(-1), 0x03);
 });
