@@ -1,0 +1,8 @@
+.git
+.vercel
+__pycache__
+*.apk
+*.dex
+*.so
+recovered/
+legu_skeletons/
