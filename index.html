@@ -1,1 +1,63 @@
-.diag-actions{display:flex;gap:8px;flex-wrap:wrap}.diag-actions .btn{flex:1 1 150px}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#6d5dfc">
+  <meta name="description" content="Paperang / 喵喵机 Web Bluetooth image printer. Images stay on-device and are rasterized locally.">
+  <title>Paperang Web Printer</title>
+  <link rel="stylesheet" href="./web/styles.css">
+  <style>
+    .diagnostics{margin-top:14px;border:1px solid var(--border);border-radius:14px;overflow:hidden}.diagnostics>summary{display:flex;align-items:center;justify-content:space-between;gap:12px;list-style:none;padding:10px 12px;background:var(--panel-2);font-size:12px;font-weight:800;cursor:pointer}.diag-summary{color:var(--muted);font-weight:650;max-width:62%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.diag-body{padding:12px}.diag-list{display:grid;grid-template-columns:1fr 1fr;gap:7px}.diag-row{display:flex;align-items:center;justify-content:space-between;gap:10px;border:1px solid var(--border);border-radius:10px;padding:8px 9px;background:var(--panel-2);font-size:11px}.diag-row span{color:var(--muted);min-width:0}.diag-row strong{font-size:10px;white-space:nowrap}.diag-row[data-state="running"] strong{color:var(--accent)}.diag-row[data-state="ok"] strong{color:var(--ok)}.diag-row[data-state="warn"] strong{color:#b7791f}.diag-row[data-state="error"] strong{color:var(--danger)}.diag-row[data-state="idle"] strong{color:var(--muted)}.device-info-panel{margin:9px 0;padding:9px 10px;border-radius:10px;background:var(--code);color:#d7dae0;white-space:pre-wrap;overflow-wrap:anywhere;font:10px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;min-height:36px}@media(max-width:560px){.diag-list{grid-template-columns:1fr}.diag-summary{max-width:55%}}
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">P</span><div class="brand-copy"><h1>Paperang Web Printer</h1><p>本地栅格化 · Web Bluetooth · P1 / P2</p></div></div>
+    <div class="badge" id="status" role="status" aria-live="polite">初始化中</div>
+  </header>
+  <section class="notice" aria-label="浏览器兼容性提示"><div><strong>图片不会上传服务器。</strong><span>处理和打印数据都留在浏览器本地。Web Bluetooth 需要 HTTPS；iPhone / iPad Safari 原生不支持。</span></div></section>
+  <div class="workspace">
+    <aside class="controls panel" aria-label="打印设置">
+      <section class="control-section upload-section"><div class="section-heading"><div><span class="eyebrow">STEP 1</span><h2>选择图片</h2></div><span class="mini-chip" id="profileHint">预览：P1 384px</span></div><label class="upload-card" for="imageFile"><span class="upload-icon" aria-hidden="true">＋</span><span><strong>选择图片</strong><small>PNG / JPEG / WebP / GIF · ≤25 MB</small></span><input id="imageFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></label></section>
+      <section class="control-section image-controls"><div class="section-heading"><div><span class="eyebrow">STEP 2</span><h2>图像处理</h2></div></div><div class="field"><label for="profile">未连接时预览机型</label><select id="profile"><option value="384">P1 · 384 px</option><option value="576">P2 · 576 px</option></select></div><div class="field"><div class="range-label"><label for="scale">内容宽度</label><span class="value"><span id="scaleValue">100</span>%</span></div><input id="scale" type="range" min="10" max="100" value="100"></div><div class="two-col"><div class="field"><label for="rotate">旋转</label><select id="rotate"><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select></div><div class="field"><label for="dither">二值化</label><select id="dither"><option value="threshold">固定阈值</option><option value="floyd">Floyd–Steinberg</option><option value="atkinson">Atkinson</option></select></div></div><div class="field"><div class="range-label"><label for="threshold">阈值</label><span id="thresholdValue" class="value">128</span></div><input id="threshold" type="range" min="0" max="255" value="128"></div><label class="check"><input id="invert" type="checkbox"><span>黑白反相</span></label></section>
+      <details class="advanced"><summary><span>高级设置</span><span class="summary-hint">浓度 · 亮度 · GATT</span></summary><div class="advanced-body"><div class="field"><div class="range-label"><label for="contrast">对比度</label><span id="contrastValue" class="value">0</span></div><input id="contrast" type="range" min="-100" max="100" value="0"></div><div class="field"><div class="range-label"><label for="brightness">亮度</label><span id="brightnessValue" class="value">0</span></div><input id="brightness" type="range" min="-100" max="100" value="0"></div><div class="field"><div class="range-label"><label for="density">打印浓度</label><span id="densityValue" class="value">75</span></div><input id="density" type="range" min="0" max="100" value="75"></div><div class="two-col"><div class="field"><label for="feedMm">打印后走纸</label><div class="input-suffix"><input id="feedMm" type="number" min="0" max="100" step="0.5" value="5"><span>mm</span></div></div><div class="field"><label for="gattChunk">GATT 分片</label><div class="input-suffix"><input id="gattChunk" type="number" min="20" max="512" step="1" value="237"><span>B</span></div></div></div><p class="helper">若出现 “value too long”，可将 GATT 分片降到 100、64 或 20。</p></div></details>
+      <section class="control-section device-section"><div class="section-heading"><div><span class="eyebrow">STEP 3</span><h2>连接设备</h2></div></div><div class="device-card"><div><span class="device-dot" aria-hidden="true"></span><span>当前 raster</span></div><strong id="width">384px (48 bytes/row)</strong></div><div class="desktop-actions"><button id="connectBtn" class="btn primary" type="button">连接打印机</button><button id="disconnectBtn" class="btn" type="button" disabled>断开</button></div><div class="desktop-actions secondary-actions"><button id="feedBtn" class="btn" type="button" disabled>仅走纸</button><button id="selfTestBtn" class="btn" type="button" disabled>P1 自检</button></div></section>
+    </aside>
+    <section class="preview-panel panel" aria-label="打印预览">
+      <div class="preview-head"><div><span class="eyebrow">PREVIEW</span><h2>实际打印预览</h2><div id="imageMeta" class="meta">尚未选择图片</div></div><button id="exportRaster" class="btn compact" type="button" disabled>导出 .bin</button></div>
+      <div class="canvas-stage"><div class="paper-label"><span>THERMAL PAPER</span><span id="paperWidthLabel">384 DOTS</span></div><div class="canvas-wrap"><canvas id="previewCanvas" width="384" height="180" aria-label="打印二值图预览"></canvas></div></div><canvas id="sourceCanvas" class="source-hidden"></canvas>
+      <div class="print-card"><div class="print-copy"><strong>准备打印</strong><span>连接设备并确认预览后发送 raster 数据</span></div><button id="printBtn" class="btn primary print-main" type="button" disabled>打印图片</button><progress id="progress" max="1" value="0" aria-label="打印传输进度"></progress></div>
+      <details class="diagnostics" open>
+        <summary><span>连接诊断</span><span id="diagSummary" class="diag-summary">等待连接</span></summary>
+        <div class="diag-body">
+          <div id="diagList" class="diag-list">
+            <div class="diag-row" data-stage="gatt" data-state="idle"><span>BLE GATT</span><strong>等待</strong></div>
+            <div class="diag-row" data-stage="profile" data-state="idle"><span>Service / Profile</span><strong>等待</strong></div>
+            <div class="diag-row" data-stage="notify" data-state="idle"><span>Notify / CCCD</span><strong>等待</strong></div>
+            <div class="diag-row" data-stage="handshake" data-state="idle"><span>System 01/17 握手</span><strong>等待</strong></div>
+            <div class="diag-row" data-stage="sw" data-state="idle"><span>软件版本</span><strong>等待</strong></div>
+            <div class="diag-row" data-stage="auth" data-state="idle"><span>官方鉴权</span><strong>等待</strong></div>
+            <div class="diag-row" data-stage="info" data-state="idle"><span>设备信息</span><strong>等待</strong></div>
+            <div class="diag-row" data-stage="official" data-state="idle"><span>官方 onDevConnSuccess</span><strong>等待</strong></div>
+            <div class="diag-row" data-stage="compat" data-state="idle"><span>兼容 Thermal 05/0F</span><strong>等待</strong></div>
+            <div class="diag-row" data-stage="ready" data-state="idle"><span>打印可用性</span><strong>等待</strong></div>
+          </div>
+          <pre id="deviceInfoPanel" class="device-info-panel">尚未读取设备信息</pre>
+          <div class="diag-actions">
+            <button id="rerunDiagBtn" class="btn compact" type="button" disabled>重新诊断</button>
+            <button id="exportDiagBtn" class="btn compact" type="button" disabled>导出诊断 JSON</button>
+          </div>
+          <p class="helper">“官方”表示 APK 的 shakeHand → auth → device info → doConnSuccess 状态机；“兼容”仅表示已验证的本地 A5 打印通道可响应。导出内容不包含 Paperang 账号 Token 或 APK App Secret，但设备回包可能包含设备 SN。</p>
+        </div>
+      </details>
+      <details class="logs" open><summary><span>通信日志</span><button id="clearLog" class="text-btn" type="button">清空</button></summary><pre id="log" class="log" aria-live="polite"></pre></details>
+    </section>
+  </div>
+  <footer class="footer">实验性互操作工具，仅连接并测试你拥有或获授权操作的打印机。不同硬件批次可能使用不同 GATT characteristic 或协议版本。</footer>
+</main>
+<div class="mobile-dock" aria-label="移动端快捷操作"><button id="mobileConnectProxy" class="dock-btn" type="button"><span class="dock-icon">⌁</span><span>连接</span></button><button id="mobilePrintProxy" class="dock-btn dock-primary" type="button" disabled><span class="dock-icon">▣</span><span>打印</span></button></div>
+<script type="module" src="./web/src/app.js"></script>
+</body>
+</html>

@@ -45,6 +45,16 @@ export function utf8Text(bytes) {
   catch (_) { return ''; }
 }
 
+function readableTlvText(bytes) {
+  const text = utf8Text(bytes);
+  if (!text) return '';
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (cp === 0xfffd || cp < 0x20 || cp === 0x7f) return '';
+  }
+  return text;
+}
+
 export const P1 = Object.freeze({
   HEAD: 0x02, TAIL: 0x03, PRINT_DATA: 0x00, GET_VERSION: 0x04, GET_SN: 0x0a,
   GET_BATTERY: 0x10, SET_CRC_KEY: 0x18, SET_DENSITY: 0x19, FEED_LINE: 0x1a,
@@ -88,7 +98,7 @@ export function buildTlv(tag, value) {
   return concatBytes(new Uint8Array([tag & 0xff]), u16le(data.length), data);
 }
 
-export function parseTlvArgs(args) {
+export function parseTlvArgs(args, depth = 0) {
   const data = args instanceof Uint8Array ? args : new Uint8Array(args);
   const values = [];
   let off = 0;
@@ -96,12 +106,33 @@ export function parseTlvArgs(args) {
     const tag = data[off];
     const len = data[off + 1] | (data[off + 2] << 8);
     off += 3;
-    if (off + len > data.length) return { values, complete: false, trailing: data.slice(off - 3) };
+    if (off + len > data.length) return { values, complete: false, trailing: data.slice(off - 3), nested: false };
     const bytes = data.slice(off, off + len);
-    values.push({ tag, bytes, text: utf8Text(bytes) });
+    values.push({ tag, bytes, text: readableTlvText(bytes) });
     off += len;
   }
-  return { values, complete: off === data.length, trailing: data.slice(off) };
+  const complete = off === data.length;
+
+  // Current FF00/A5 Paperang responses can wrap their real fields in one TLV
+  // container. Real P1 captures show 01/17 as: 01 <len> { 01 randomCode,
+  // 02 md5/sign, 03 SN, 04 authCode }, and 01/08 similarly wraps the model
+  // enum + printable model string. Flatten only when the inner buffer is itself
+  // a complete multi-field TLV sequence; ordinary strings/numbers are untouched.
+  if (complete && depth < 2 && values.length === 1 && values[0].bytes.length >= 6) {
+    const inner = parseTlvArgs(values[0].bytes, depth + 1);
+    if (inner.complete && inner.values.length >= 2) {
+      const flattened = inner.values.map((value, index) => ({
+        ...value, parentTag: values[0].tag, originalIndex: index,
+      }));
+      // Diagnostic scalar readers use the first TLV. Prefer a clean printable
+      // field (e.g. model "P1") over a tiny numeric enum, while preserving tag
+      // order when fields are all printable (the 01/17 auth material case).
+      flattened.sort((a, b) => Number(Boolean(b.text)) - Number(Boolean(a.text)) || a.originalIndex - b.originalIndex);
+      return { values: flattened, complete: true, trailing: new Uint8Array(), nested: true, containerTag: values[0].tag };
+    }
+  }
+
+  return { values, complete, trailing: data.slice(off), nested: false };
 }
 
 export function buildSystemRequest(command, args = new Uint8Array()) {
@@ -168,7 +199,10 @@ export class A5StreamParser {
         if (this.buffer[i] === 0xa5 && this.buffer[i + 1] === 0x01) { start = i; break; }
       }
       if (start < 0) {
-        this.buffer = this.buffer.slice(Math.max(0, this.buffer.length - 1));
+        // FF03 carries short status records such as 01 01 / 01 07 / 02 f4 00.
+        // They are not A5 fragments. Keep only a trailing 0xA5 because it could
+        // be the first byte of a genuinely split A5 prefix.
+        this.buffer = this.buffer[this.buffer.length - 1] === 0xa5 ? this.buffer.slice(-1) : new Uint8Array();
         break;
       }
       if (start > 0) this.buffer = this.buffer.slice(start);
@@ -187,6 +221,7 @@ export class A5StreamParser {
         this.buffer = this.buffer.slice(2);
       }
     }
+    if (this.buffer.length === 1 && this.buffer[0] !== 0xa5) this.buffer = new Uint8Array();
     return frames;
   }
 }

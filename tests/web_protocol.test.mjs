@@ -1,101 +1,113 @@
-# 05 — Web printer implementation
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  A5, CRC_SEED, P1, a5PrintChunkSize, buildA5PrintDataPayload, crc32, hex,
+  A5StreamParser, buildHandshakeNoParamsRequest, buildHandshakeRequest, buildSystemRequest, parseA5Payload, parseTlvArgs,
+  packA5Frame, packP1Frame, parseA5Frame, p1RegistrationFrame,
+} from '../web/src/protocol.js';
+import { packBinaryPixels, thresholdPixels } from '../web/src/raster.js';
 
-The repository root `index.html` is a dependency-free Web Bluetooth printer UI. The current production build is deployed at `https://paperang-research.vercel.app`.
+test('CRC32 matches Paperang fixed registration packet', () => {
+  assert.equal(CRC_SEED, 0x35769521);
+  assert.equal(crc32(Uint8Array.from([0x21,0x95,0x76,0x35])), 0x2144df1c);
+  assert.equal(hex(p1RegistrationFrame()), '0218000400219576351cdf442103');
+});
 
-## Supported paths
+test('P1 frame encodes command/index/LE length/payload/CRC/tail', () => {
+  const frame = packP1Frame(P1.SET_DENSITY, Uint8Array.from([75]), 3);
+  assert.equal(frame[0], 0x02); assert.equal(frame[1], 0x19); assert.equal(frame[2], 3);
+  assert.equal(frame[3], 1); assert.equal(frame[4], 0); assert.equal(frame.at(-1), 0x03);
+});
 
-### P1 / Protocol 0x02
+test('A5 known start frame and parser', () => {
+  const frame = packA5Frame(A5.START_RASTER_PAYLOAD);
+  assert.equal(hex(frame), 'a5010500051901000039cb63a65a');
+  const parsed = parseA5Frame(frame);
+  assert.ok(parsed); assert.deepEqual([...parsed.payload], [...A5.START_RASTER_PAYLOAD]);
+});
 
-- raster width: 384 px / 48 bytes per row
-- service: `49535343-fe7d-4ae5-8fa9-9fafd205e455`
-- known write characteristics:
-  - `49535343-6daa-4d02-abf6-19569aca69fe` (historical WebBLE implementation)
-  - `49535343-8841-43f4-a8d4-ecbe34729bb3` (newer physically validated implementation)
-- notify: `49535343-1e4d-4bd9-ba61-23c647249616`
-- protocol: `02 | cmd | index | lenLE16 | payload | CRC32LE | 03`
-- CRC seed: `0x35769521`
-- raster: black=1, white=0, MSB first
-- desktop path normally sends 10 full rows / 480 payload bytes per protocol frame; iOS/WebBLE mode uses smaller 3-row frames and slower writes
+test('A5 P2 chunking stays row aligned and under validated frame budget', () => {
+  assert.equal(a5PrintChunkSize(72), 144);
+  const payload = buildA5PrintDataPayload(new Uint8Array(144), 1, 72, false);
+  const frame = packA5Frame(payload);
+  assert.ok(frame.length <= 237);
+});
 
-On connect, the web app writes the cross-validated fixed CRC registration frame:
+test('raster packs black=1 MSB first', () => {
+  const bits = Uint8Array.from([1,0,1,0,0,0,0,1]);
+  assert.deepEqual([...packBinaryPixels(bits, 8, 1)], [0xa1]);
+  assert.deepEqual([...thresholdPixels(Uint8Array.from([0,255]), 128, false)], [1,0]);
+});
 
-```text
-0218000400219576351cdf442103
-```
+test('APK-confirmed A5 System 01/17 handshake frame matches captured layout', () => {
+  const frame = packA5Frame(buildHandshakeRequest('P4sdFat2pBd0h4mh'));
+  assert.equal(hex(frame), 'a5011800011701130001100050347364466174327042643068346d687c3eb3c95a');
+  const parsed = parseA5Payload(parseA5Frame(frame));
+  assert.equal(parsed.domain, 0x01);
+  assert.equal(parsed.command, 0x17);
+  assert.equal(parsed.kind, 0x01);
+  assert.equal(parsed.tlv.values[0].tag, 0x01);
+  assert.equal(parsed.tlv.values[0].text, 'P4sdFat2pBd0h4mh');
+});
 
-It then uses the same seed for subsequent frames.
+test('A5 stream parser reassembles fragmented notifications and skips BLE noise', () => {
+  const parser = new A5StreamParser();
+  const one = packA5Frame(buildSystemRequest(A5.SYS_PROTOCOL_VERSION));
+  const two = packA5Frame(buildSystemRequest(A5.SYS_SN));
+  assert.equal(parser.push(Uint8Array.from([0x01, 0x04, ...one.slice(0, 5)])).length, 0);
+  const frames = parser.push(Uint8Array.from([...one.slice(5), ...two]));
+  assert.equal(frames.length, 2);
+  assert.equal(parseA5Payload(frames[0]).command, A5.SYS_PROTOCOL_VERSION);
+  assert.equal(parseA5Payload(frames[1]).command, A5.SYS_SN);
+});
 
-### P2 / FF00 + A5
+test('TLV parser handles multiple handshake response fields', () => {
+  const bytes = Uint8Array.from([1,2,0,65,66, 2,3,0,120,121,122]);
+  const parsed = parseTlvArgs(bytes);
+  assert.equal(parsed.complete, true);
+  assert.equal(parsed.values[0].text, 'AB');
+  assert.equal(parsed.values[1].text, 'xyz');
+});
 
-Cross-validated against a 2026 implementation reporting physical validation on Windows:
+test('A5 no-parameter handshake stays a System 01/17 request', () => {
+  const frame = packA5Frame(buildHandshakeNoParamsRequest());
+  const parsed = parseA5Payload(parseA5Frame(frame));
+  assert.equal(parsed.domain, A5.DOMAIN_SYSTEM);
+  assert.equal(parsed.command, A5.SYS_SHAKE_HAND);
+  assert.equal(parsed.kind, A5.TYPE_REQUEST);
+  assert.equal(parsed.args.length, 0);
+});
 
-- raster width: 576 px / 72 bytes per row
-- service `0000ff00-0000-1000-8000-00805f9b34fb`
-- notify `ff01`
-- write `ff02`
-- status notify `ff03`
-- frame: `A5 01 | lenLE16 | payload | CRC32LE | 5A`
-- CRC seed: `0x35769521`
+test('nested A5 auth envelope is flattened into four real fields', () => {
+  const inner = Uint8Array.from([
+    1,3,0,97,98,99,
+    2,4,0,100,101,97,100,
+    3,2,0,80,49,
+    4,3,0,120,121,122,
+  ]);
+  const wrapped = new Uint8Array(3 + inner.length);
+  wrapped.set([1, inner.length & 255, inner.length >>> 8], 0);
+  wrapped.set(inner, 3);
+  const parsed = parseTlvArgs(wrapped);
+  assert.equal(parsed.nested, true);
+  assert.deepEqual(parsed.values.map((v) => v.tag), [1,2,3,4]);
+  assert.deepEqual(parsed.values.map((v) => v.text), ['abc','dead','P1','xyz']);
+});
 
-Print sequence implemented by the site:
+test('nested device-model response prefers printable model over numeric enum', () => {
+  const wrapped = Uint8Array.from([1,9,0, 1,1,0,1, 2,2,0,80,49]);
+  const parsed = parseTlvArgs(wrapped);
+  assert.equal(parsed.nested, true);
+  assert.equal(parsed.values[0].tag, 2);
+  assert.equal(parsed.values[0].text, 'P1');
+  assert.equal(parsed.values[1].tag, 1);
+  assert.equal(parsed.values[1].bytes[0], 1);
+});
 
-```text
-status       payload 05 0F 01 00 00 00
-start raster payload 05 19 01 00 00
-print chunks domain 05 / command 1B
-finish       payload 05 22 01 02 00 00 00
-```
-
-A5 raster chunks are row-aligned. With 72 bytes per row, a 237-byte frame budget and 26 bytes of framing/command overhead yield 144 bytes (= 2 rows) of raster per A5 packet.
-
-## Image pipeline
-
-The UI performs all processing locally:
-
-1. decode image with `createImageBitmap`;
-2. rotate and fit/center to the target head width;
-3. flatten alpha against white;
-4. luminance conversion;
-5. brightness/contrast adjustment;
-6. fixed threshold, Floyd–Steinberg, or Atkinson dithering;
-7. black=1 / white=0 conversion;
-8. MSB-first packing into 48-byte (P1) or 72-byte (P2) rows.
-
-No image is uploaded by the web app.
-
-## Browser support
-
-Web Bluetooth is available in Chromium-family desktop browsers and Android Chrome/Samsung Internet, but not native Safari on iOS/iPadOS or Firefox. It is also restricted to secure contexts, so serve the repository via HTTPS (for example GitHub Pages) rather than opening `index.html` as a local file.
-
-## Validation
-
-Run the pure protocol/raster tests without a printer:
-
-```bash
-npm test
-```
-
-The suite fixes two important regression vectors:
-
-```text
-P1 CRC registration: 0218000400219576351cdf442103
-P2 A5 start frame:   a5010500051901000039cb63a65a
-```
-
-Hardware validation still matters because Paperang has shipped different Bluetooth profiles across model/hardware revisions.
-
-
-## Official vs compatible readiness
-
-The current Android APK does not treat `BluetoothGatt.connect()` as printer-ready. Recovered SDK metadata shows a multi-stage lifecycle involving System handshake, software-version retrieval, cache/auth decisions, device information, final `doConnSuccess`, and heartbeat startup. See [`07_official_connection_state_machine.md`](07_official_connection_state_machine.md).
-
-The web UI therefore displays two independent concepts:
-
-- **Official ready** — the SDK's full authenticated `onDevConnSuccess` lifecycle has been reproduced. The browser currently does not claim this for server-auth A5 devices.
-- **Compat ready** — a non-printing local Thermal `05/0F` probe receives a valid A5 response. Printing is enabled only from this compatibility state.
-
-If `01/17` official handshake fails, the browser still performs the independent Thermal probe. This is diagnostic: failure of the official handshake does not automatically prove the local print protocol is unusable.
-
-## Connection diagnostic JSON
-
-The UI can export a `paperang-web-diagnostic-v1` JSON report containing stage status, characteristic UUIDs, raw BLE RX hex, reassembled A5 frames, ordered handshake TLVs, read-only device information, and a disconnect-time snapshot. It deliberately excludes Paperang account tokens, extracted APK app secrets, or other proprietary credentials. Printer responses can include a device serial number.
+test('A5 stream parser drops FF03 status records instead of keeping fake fragments', () => {
+  const parser = new A5StreamParser();
+  assert.equal(parser.push(Uint8Array.from([0x01,0x01])).length, 0);
+  assert.equal(parser.buffer.length, 0);
+  assert.equal(parser.push(Uint8Array.from([0x02,0xf4,0x00])).length, 0);
+  assert.equal(parser.buffer.length, 0);
+});
