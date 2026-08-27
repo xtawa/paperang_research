@@ -1,4 +1,8 @@
 export const CRC_SEED = 0x35769521 >>> 0;
+// Public Paperang P1 implementations (ihciah/miaomiaoji-tool and descendants)
+// negotiate a per-session CRC key through command 0x18. Keep the same proven
+// key so the browser path can be compared byte-for-byte with those clients.
+export const P1_SESSION_CRC_KEY = 0x06b8ef59 >>> 0;
 
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -68,7 +72,13 @@ export function packP1Frame(command, payload = new Uint8Array(), packetIndex = 0
     u32le(crc32(data, seed)), new Uint8Array([P1.TAIL]));
 }
 
-export function p1RegistrationFrame() { return packP1Frame(P1.SET_CRC_KEY, u32le(CRC_SEED), 0, CRC_SEED); }
+export function p1RegistrationFrame(sessionKey = P1_SESSION_CRC_KEY) {
+  // The printer receives (sessionKey XOR standardKey), while this registration
+  // packet itself is still CRC'd with the standard key. Subsequent packets must
+  // use sessionKey. This matches ihciah/miaomiaoji-tool registerCrcKeyToBt().
+  const encoded = (Number(sessionKey) ^ CRC_SEED) >>> 0;
+  return packP1Frame(P1.SET_CRC_KEY, u32le(encoded), 0, CRC_SEED);
+}
 
 export const A5 = Object.freeze({
   PREFIX: new Uint8Array([0xa5, 0x01]), SUFFIX: 0x5a, MAX_FRAME_SIZE: 237, PRINT_DATA_OVERHEAD: 26,
@@ -113,20 +123,12 @@ export function parseTlvArgs(args, depth = 0) {
   }
   const complete = off === data.length;
 
-  // Current FF00/A5 Paperang responses can wrap their real fields in one TLV
-  // container. Real P1 captures show 01/17 as: 01 <len> { 01 randomCode,
-  // 02 md5/sign, 03 SN, 04 authCode }, and 01/08 similarly wraps the model
-  // enum + printable model string. Flatten only when the inner buffer is itself
-  // a complete multi-field TLV sequence; ordinary strings/numbers are untouched.
   if (complete && depth < 2 && values.length === 1 && values[0].bytes.length >= 6) {
     const inner = parseTlvArgs(values[0].bytes, depth + 1);
     if (inner.complete && inner.values.length >= 2) {
       const flattened = inner.values.map((value, index) => ({
         ...value, parentTag: values[0].tag, originalIndex: index,
       }));
-      // Diagnostic scalar readers use the first TLV. Prefer a clean printable
-      // field (e.g. model "P1") over a tiny numeric enum, while preserving tag
-      // order when fields are all printable (the 01/17 auth material case).
       flattened.sort((a, b) => Number(Boolean(b.text)) - Number(Boolean(a.text)) || a.originalIndex - b.originalIndex);
       return { values: flattened, complete: true, trailing: new Uint8Array(), nested: true, containerTag: values[0].tag };
     }
@@ -183,9 +185,6 @@ export function parseA5Payload(payloadOrFrame) {
   return { domain: payload[0], command: payload[1], kind: payload[2], args, tlv: parseTlvArgs(args) };
 }
 
-// BLE notifications are not packet boundaries. The Android APK's ProtocolParser keeps
-// temporary bytes for exactly this reason. This reassembler accepts fragmented/combined
-// notification data and emits validated A5 frames while discarding unrelated BLE status bytes.
 export class A5StreamParser {
   constructor() { this.buffer = new Uint8Array(); }
   reset() { this.buffer = new Uint8Array(); }
@@ -199,9 +198,6 @@ export class A5StreamParser {
         if (this.buffer[i] === 0xa5 && this.buffer[i + 1] === 0x01) { start = i; break; }
       }
       if (start < 0) {
-        // FF03 carries short status records such as 01 01 / 01 07 / 02 f4 00.
-        // They are not A5 fragments. Keep only a trailing 0xA5 because it could
-        // be the first byte of a genuinely split A5 prefix.
         this.buffer = this.buffer[this.buffer.length - 1] === 0xa5 ? this.buffer.slice(-1) : new Uint8Array();
         break;
       }
@@ -217,7 +213,6 @@ export class A5StreamParser {
         frames.push(parsed);
         this.buffer = this.buffer.slice(total);
       } else {
-        // Bad CRC/tail: resync at the next possible prefix instead of poisoning the stream.
         this.buffer = this.buffer.slice(2);
       }
     }
