@@ -8,6 +8,31 @@ export function isP1A5Device(instance) {
   return instance?.profile === 'p2-a5' && /^P1(?:\b|$)/.test(normalizedA5Model(instance));
 }
 
+export function decodeA5ResponseEnvelope(result) {
+  const parsed = result?.parsed;
+  if (!parsed || parsed.kind !== 0x02) return { state: 'unknown', code: null, data: new Uint8Array() };
+  const args = parsed.args instanceof Uint8Array ? parsed.args : new Uint8Array(parsed.args || []);
+  if (args.length < 3) return { state: 'unknown', code: null, data: args };
+  const code = args[0];
+  const len = args[1] | (args[2] << 8);
+  if (len !== args.length - 3) return { state: 'unknown', code, data: args.slice(3) };
+  // Real-device evidence: accepted read/set commands use envelope 01 <len>,
+  // while this P1's PrintStart/Data/End return 02 0000 and do not actuate.
+  if (code === 0x01) return { state: 'ok', code, data: args.slice(3) };
+  if (code === 0x02) return { state: 'error', code, data: args.slice(3) };
+  return { state: 'unknown', code, data: args.slice(3) };
+}
+
+function assertA5Accepted(result, label) {
+  const status = decodeA5ResponseEnvelope(result);
+  if (status.state === 'ok') return status;
+  const code = status.code == null ? '??' : `0x${status.code.toString(16).padStart(2, '0')}`;
+  if (status.state === 'error') {
+    throw new Error(`${label} 被设备拒绝（response envelope ${code} / 02 0000）。System 已连接，但打印会话尚未获准；优先检查官方 Auth/onDevConnSuccess 状态。`);
+  }
+  throw new Error(`${label} 返回未知 A5 响应（code=${code}）`);
+}
+
 export function p1A5ChunkSize(widthBytes = 48, maxFrameSize = 237, overhead = 26) {
   if (!Number.isInteger(widthBytes) || widthBytes <= 0) throw new RangeError('widthBytes must be positive');
   const maxData = maxFrameSize - overhead;
@@ -34,19 +59,28 @@ export function installP1A5Overrides(PaperangWebTransport, protocol) {
       timeout: this.isIOS ? 1500 : 1050,
     });
 
-    if (start) {
+    const startStatus = decodeA5ResponseEnvelope(start);
+    const accepted = startStatus.state === 'ok';
+
+    // A response frame is not automatically an ACK. Real P1 FF00/A5 captures show
+    // 01 0000 for accepted commands (e.g. density) and 02 0000 for rejected print
+    // commands. Only close an actually accepted probe.
+    if (accepted) {
       const end = await this.queryA5(P1_A5_PRINT_END_PAYLOAD, {
         domain: A5.DOMAIN_THERMAL,
         command: 0x1a,
         timeout: this.isIOS ? 900 : 650,
       });
-      if (!end) this.emit('log', 'P1+A5 探测：05/19 已接受，但 05/1A PrintEnd 未收到 A5 ACK');
+      const endStatus = decodeA5ResponseEnvelope(end);
+      if (endStatus.state !== 'ok') this.emit('log', `P1+A5 探测：05/1A PrintEnd 未被确认（state=${endStatus.state}, code=${endStatus.code ?? 'n/a'}）`);
     }
 
-    this.compatReady = Boolean(start);
+    this.compatReady = accepted;
     this.protocolReady = this.compatReady;
-    if (start) this.diag('compat', 'ok', 'P1+A5 05/19 PrintStart 有响应；384px 打印通道可尝试');
-    else this.diag('compat', 'error', 'P1+A5 05/19 PrintStart 无 A5 响应；此时更可能是 Auth/设备状态门控');
+    if (accepted) this.diag('compat', 'ok', 'P1+A5 05/19 PrintStart 返回 OK(01)；384px 打印会话可用');
+    else if (startStatus.state === 'error') this.diag('compat', 'error', 'P1+A5 05/19 返回 ERROR(02 0000)：命令格式可识别，但设备拒绝开始打印；优先检查 Auth/onDevConnSuccess');
+    else if (start) this.diag('compat', 'error', `P1+A5 05/19 有响应但状态未知（code=${startStatus.code ?? 'n/a'}）`);
+    else this.diag('compat', 'error', 'P1+A5 05/19 无 A5 响应；打印通道未就绪');
     return this.compatReady;
   };
 
@@ -74,19 +108,27 @@ export function installP1A5Overrides(PaperangWebTransport, protocol) {
     }
 
     this.emit('log', 'P1+A5：发送 05/19 PrintStart');
-    await this.queryA5(A5.START_RASTER_PAYLOAD, {
+    const start = await this.queryA5(A5.START_RASTER_PAYLOAD, {
       domain: A5.DOMAIN_THERMAL,
       command: 0x19,
       timeout: this.isIOS ? 1500 : 1050,
       required: true,
     });
+    assertA5Accepted(start, 'P1+A5 05/19 PrintStart');
 
+    // For P1+A5 we keep every 05/1B data packet as TYPE_REQUEST and close the job
+    // explicitly with 05/1A. This follows the APK's printStart/printData/printFinish
+    // method family instead of P2's final-chunk/05/22 behavior.
     const size = a5PrintChunkSize(widthBytes);
     let packetNumber = 1;
     for (let offset = 0; offset < data.length; offset += size) {
       const chunk = data.slice(offset, offset + size);
       const payload = buildA5PrintDataPayload(chunk, packetNumber, widthBytes, false);
+      const wait = this.waitForA5(({ parsed }) => Boolean(parsed && parsed.domain === A5.DOMAIN_THERMAL && parsed.command === 0x1b), this.isIOS ? 1000 : 700);
       await this.writeFrame(packA5Frame(payload), { preserveFrame: true, preferResponse: false });
+      const ack = await wait;
+      if (!ack) throw new Error(`P1+A5 05/1B 第 ${packetNumber} 包未收到响应`);
+      assertA5Accepted(ack, `P1+A5 05/1B 第 ${packetNumber} 包`);
       packetNumber += 1;
       this.emit('progress', { sent: Math.min(offset + chunk.length, data.length), total: data.length });
       await new Promise((resolve) => setTimeout(resolve, this.isIOS ? 18 : 10));
@@ -98,6 +140,7 @@ export function installP1A5Overrides(PaperangWebTransport, protocol) {
       command: 0x1a,
       timeout: this.isIOS ? 1400 : 1000,
     });
-    if (!finish) this.emit('log', 'P1+A5：05/1A PrintEnd 未收到 A5 ACK；不再继续发送');
+    if (!finish) throw new Error('P1+A5：05/1A PrintEnd 未收到 A5 响应');
+    assertA5Accepted(finish, 'P1+A5 05/1A PrintEnd');
   };
 }
