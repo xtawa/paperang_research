@@ -41,15 +41,37 @@ export class PaperangWebTransport extends EventTarget {
   constructor() {
     super();
     this.device = null; this.server = null; this.profile = null; this.writeChar = null; this.notifyChars = [];
-    this.gattChunk = 237; this.sessionConnected = false; this.protocolReady = false; this.isIOS = isIOSLike();
+    this.gattChunk = 237; this.sessionConnected = false; this.protocolReady = false; this.compatReady = false; this.officialReady = false; this.isIOS = isIOSLike();
     this.a5Parser = new A5StreamParser(); this.a5Waiters = new Set(); this.deviceInfo = {}; this.handshake = null;
-    this.authState = 'unknown'; this.onDisconnected = this.onDisconnected.bind(this);
+    this.authState = 'unknown'; this.diagnostics = {}; this.rxHistory = []; this.a5History = []; this.lastDiagnosticReport = null;
+    this.onDisconnected = this.onDisconnected.bind(this);
   }
 
   get connected() { return Boolean(this.sessionConnected && this.writeChar); }
-  get ready() { return Boolean(this.connected && (this.profile !== 'p2-a5' || this.protocolReady)); }
+  get ready() { return Boolean(this.connected && (this.profile === 'p2-a5' ? this.compatReady : this.protocolReady)); }
   emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
-  diag(stage, state, detail = '') { this.emit('diagnostic', { stage, state, detail, deviceInfo: { ...this.deviceInfo }, authState: this.authState }); }
+  diag(stage, state, detail = '') {
+    const item = { stage, state, detail, at: new Date().toISOString() };
+    this.diagnostics[stage] = item;
+    this.emit('diagnostic', { ...item, deviceInfo: { ...this.deviceInfo }, authState: this.authState, officialReady: this.officialReady, compatReady: this.compatReady });
+  }
+
+  currentDiagnosticReport(reason = '') {
+    return {
+      schema: 'paperang-web-diagnostic-v1', generatedAt: new Date().toISOString(), reason,
+      browser: { userAgent: navigator.userAgent || '', platform: navigator.platform || '', maxTouchPoints: navigator.maxTouchPoints || 0, iosLike: this.isIOS },
+      connection: { connected: this.connected, ready: this.ready, officialReady: this.officialReady, compatReady: this.compatReady, profile: this.profile, name: this.device?.name || null,
+        writeCharacteristic: this.writeChar?.uuid || null, notifyCharacteristics: this.notifyChars.map((c) => c.uuid) },
+      authState: this.authState, deviceInfo: { ...this.deviceInfo }, handshake: this.handshake ? JSON.parse(JSON.stringify(this.handshake)) : null,
+      diagnostics: JSON.parse(JSON.stringify(this.diagnostics)), rxHistory: this.rxHistory.slice(-120), a5History: this.a5History.slice(-80),
+      note: 'No Paperang account token, app secret, or extracted proprietary credential is included. Device responses may contain a device serial number.'
+    };
+  }
+
+  getDiagnosticReport() {
+    if (!this.connected && this.lastDiagnosticReport) return this.lastDiagnosticReport;
+    return this.currentDiagnosticReport();
+  }
 
   async requestAndConnect() {
     if (!navigator.bluetooth) throw new Error('当前浏览器不支持 Web Bluetooth');
@@ -82,7 +104,7 @@ export class PaperangWebTransport extends EventTarget {
       this.diag('handshake', 'running', 'Protocol 02 CRC key registration');
       await this.writeFrame(p1RegistrationFrame(), { preferResponse: this.isIOS });
       await sleep(this.isIOS ? 180 : 80);
-      this.protocolReady = true; this.authState = 'legacy-not-required';
+      this.protocolReady = true; this.compatReady = true; this.authState = 'legacy-not-required';
       this.diag('handshake', 'ok', 'Protocol 02 registration sent');
       this.diag('ready', 'ok', 'P1 兼容打印就绪');
     } else if (this.profile === 'p2-a5') {
@@ -90,12 +112,14 @@ export class PaperangWebTransport extends EventTarget {
     }
 
     const detail = { name: this.device.name || 'Unknown', profile: this.profile, ready: this.ready, ios: this.isIOS,
-      authState: this.authState, deviceInfo: { ...this.deviceInfo } };
+      officialReady: this.officialReady, compatReady: this.compatReady, authState: this.authState, deviceInfo: { ...this.deviceInfo } };
     this.emit('connected', detail);
     return detail;
   }
 
   handleNotification(uuid, bytes) {
+    this.rxHistory.push({ at: new Date().toISOString(), uuid, hex: hex(bytes), length: bytes.length });
+    if (this.rxHistory.length > 240) this.rxHistory.splice(0, this.rxHistory.length - 240);
     this.emit('notification', { uuid, bytes });
     if (this.profile !== 'p2-a5') return;
     const frames = this.a5Parser.push(bytes);
@@ -105,6 +129,8 @@ export class PaperangWebTransport extends EventTarget {
     }
     for (const frame of frames) {
       const parsed = parseA5Payload(frame);
+      this.a5History.push({ at: new Date().toISOString(), raw: hex(frame.raw), domain: parsed?.domain ?? null, command: parsed?.command ?? null, kind: parsed?.kind ?? null, argsHex: parsed ? hex(parsed.args) : null, tlv: parsed?.tlv?.values?.map((v) => ({ tag: v.tag, text: v.text, hex: hex(v.bytes) })) || [] });
+      if (this.a5History.length > 160) this.a5History.splice(0, this.a5History.length - 160);
       this.emit('a5frame', { frame, parsed });
       if (parsed) this.emit('log', `A5 RX domain=0x${parsed.domain.toString(16).padStart(2, '0')} cmd=0x${parsed.command.toString(16).padStart(2, '0')} type=${parsed.kind} args=${parsed.args.length}B`);
       for (const waiter of [...this.a5Waiters]) {
@@ -142,61 +168,85 @@ export class PaperangWebTransport extends EventTarget {
     return { value, response };
   }
 
+  async probeCompatibilityThermal() {
+    this.diag('compat', 'running', '探测兼容 Thermal 05/0F（不发送打印数据）');
+    const thermal = await this.queryA5(A5.STATUS_PAYLOAD, { domain: A5.DOMAIN_THERMAL, command: 0x0f, timeout: this.isIOS ? 1500 : 1050 });
+    this.compatReady = Boolean(thermal); this.protocolReady = this.compatReady;
+    if (thermal) this.diag('compat', 'ok', '05/0F 有 A5 响应，兼容打印通道可用');
+    else this.diag('compat', 'error', '05/0F 无 A5 响应；不发送 raster');
+    return this.compatReady;
+  }
+
   async initializeA5Connection() {
-    this.protocolReady = false; this.authState = 'unknown'; this.deviceInfo = {};
-    this.diag('handshake', 'running', '发送官方 SDK System 01/17 ShakeHand');
+    this.protocolReady = false; this.compatReady = false; this.officialReady = false; this.authState = 'unknown'; this.deviceInfo = {}; this.handshake = null;
+    this.diag('handshake', 'running', '发送 SDK System 01/17 ShakeHand');
     const challenge = randomChallenge16();
-    let shake = await this.queryA5(buildHandshakeRequest(challenge), { domain: A5.DOMAIN_SYSTEM, command: A5.SYS_SHAKE_HAND, timeout: this.isIOS ? 1500 : 1100 });
+    let shake = await this.queryA5(buildHandshakeRequest(challenge), { domain: A5.DOMAIN_SYSTEM, command: A5.SYS_SHAKE_HAND, timeout: this.isIOS ? 1700 : 1200 });
     let mode = 'challenge';
     if (!shake) {
-      this.emit('log', '01/17 challenge handshake 无响应，尝试 APK 中的 getSystemDeviceShakeHand_NoParams() 路径');
+      this.emit('log', '01/17 带参握手无响应，尝试 APK 中 getSystemDeviceShakeHand_NoParams() 路径');
       mode = 'no-params';
-      shake = await this.queryA5(buildHandshakeNoParamsRequest(), { domain: A5.DOMAIN_SYSTEM, command: A5.SYS_SHAKE_HAND, timeout: this.isIOS ? 1400 : 1000 });
+      shake = await this.queryA5(buildHandshakeNoParamsRequest(), { domain: A5.DOMAIN_SYSTEM, command: A5.SYS_SHAKE_HAND, timeout: this.isIOS ? 1600 : 1100 });
     }
+
     if (!shake) {
-      this.diag('handshake', 'error', '01/17 两种握手均无响应');
-      this.diag('auth', 'idle', '未进入鉴权'); this.diag('ready', 'error', 'GATT 已连接，但官方 System 握手未完成');
+      this.authState = 'not-reached';
+      this.diag('handshake', 'error', '01/17 两种握手均无 A5 响应');
+      this.diag('sw', 'idle', '握手未完成'); this.diag('auth', 'idle', '未进入鉴权'); this.diag('info', 'idle', '未进入设备信息阶段');
+      this.diag('official', 'error', '未达到官方 SDK onDevConnSuccess 状态');
+      await this.probeCompatibilityThermal();
+      this.diag('ready', this.compatReady ? 'warn' : 'error', this.compatReady ? '官方握手失败，但兼容打印通道可用' : 'GATT 已连接，但官方/兼容通道均未就绪');
       return;
     }
 
     const fields = shake.parsed?.tlv?.values || [];
-    this.handshake = { mode, challenge, fields: fields.map((x) => ({ tag: x.tag, text: x.text, hex: hex(x.bytes) })) };
-    if (fields.length >= 4) {
-      this.handshake.deviceSN = fields[0].text; this.handshake.randomCode = fields[1].text;
-      this.handshake.md5 = fields[2].text; this.handshake.authCode = fields[3].text;
-      if (this.handshake.deviceSN) this.deviceInfo.snHandshake = this.handshake.deviceSN;
-    }
-    this.diag('handshake', 'ok', `${mode}; ${fields.length} TLV field(s)`);
+    this.handshake = {
+      mode, challenge, responseCommand: shake.parsed?.command ?? null,
+      fields: fields.map((x, index) => ({ index, tag: x.tag, text: x.text, hex: hex(x.bytes), length: x.bytes.length })),
+      mappingConfidence: 'unknown-order',
+      note: 'APK log mentions randomCode+MD5+SN+authCode, while callback parameter names are unavailable after packing. Positional labels are intentionally not assigned.'
+    };
+    this.diag('handshake', 'ok', `${mode}; 收到 ${fields.length} 个 TLV 字段（保留原始顺序，不猜字段名）`);
 
+    this.diag('sw', 'running', '按 BleManager$6 顺序查询软件版本');
     const sw = await this.querySystem(A5.SYS_SW_VERSION, '软件版本');
-    if (sw) this.deviceInfo.softwareVersion = sw.value;
+    if (sw) { this.deviceInfo.softwareVersion = sw.value; this.diag('sw', 'ok', String(sw.value)); }
+    else this.diag('sw', 'warn', '01/07 无响应');
 
-    this.authState = fields.length >= 4 ? 'server-auth-not-reproduced' : 'not-indicated-by-response';
-    this.diag('auth', fields.length >= 4 ? 'warn' : 'idle', fields.length >= 4 ? '设备返回了 Auth 材料；官方 App 下一步会调用 /api/device/auth' : '握手回包未暴露四字段 Auth 材料');
+    // APK-confirmed: afterShakeHand -> SW version callback -> deviceAuth/authInServer.
+    // DeviceAuthRequest contains deviceSN/rcode/sign/code and server can also answer
+    // onNoAuthorizationRequired(). We intentionally do not replay proprietary account/app credentials.
+    const authMaterialLikely = fields.length >= 4;
+    this.authState = authMaterialLikely ? 'official-server-or-cache-check-required' : 'official-skip-path-undetermined';
+    this.diag('auth', authMaterialLikely ? 'warn' : 'idle', authMaterialLikely
+      ? '握手返回 4+ 字段；官方 App 接下来进行缓存判断 / deviceAuth / authInServer，并将 code+sign 回写设备'
+      : '未观察到典型四字段 Auth 材料；官方 canSkippAuth 分支仍需实机确认');
 
+    // APK debug metadata places queryInfoNecessary after afterAuthSuccess. We only issue
+    // read-only diagnostics here, in the same observed order; success does NOT imply auth bypass.
     const queries = [
-      [A5.SYS_PRODUCT_MODEL, '设备类型', 'deviceType'], [A5.SYS_MAX_LEN, '最大包长', 'maxLen'],
-      [A5.SYS_SN, '设备 SN', 'sn'], [A5.SYS_BATTERY, '电量', 'battery'],
-      [A5.SYS_PROTOCOL_VERSION, '协议版本', 'protocolVersion'], [A5.SYS_MAX_CACHE, '最大缓存', 'maxCache'],
+      [A5.SYS_PROTOCOL_VERSION, '协议版本', 'protocolVersion'],
+      [A5.SYS_PRODUCT_MODEL, '设备类型', 'deviceType'],
+      [A5.SYS_MAX_LEN, '最大包长', 'maxLen'],
+      [A5.SYS_MAX_CACHE, '最大缓存', 'maxCache'],
+      [A5.SYS_SN, '设备 SN', 'sn'],
+      [A5.SYS_BATTERY, '电量', 'battery'],
     ];
     let infoResponses = 0;
+    this.diag('info', 'running', '只读诊断：Protocol → Type → MaxLen → MaxCache → SN → Battery');
     for (const [cmd, label, key] of queries) {
       const result = await this.querySystem(cmd, label);
       if (result) { this.deviceInfo[key] = result.value; infoResponses += 1; }
-      await sleep(this.isIOS ? 80 : 35);
+      await sleep(this.isIOS ? 90 : 40);
     }
-    this.diag('info', infoResponses ? 'ok' : 'warn', `读取到 ${infoResponses}/${queries.length} 项设备信息`);
+    this.diag('info', infoResponses ? 'ok' : 'warn', `读取到 ${infoResponses}/${queries.length} 项；这些查询不代表 Auth 已通过`);
 
-    this.diag('protocol', 'running', '检查 Thermal 05/0F');
-    const thermal = await this.queryA5(A5.STATUS_PAYLOAD, { domain: A5.DOMAIN_THERMAL, command: 0x0f, timeout: this.isIOS ? 1400 : 1000 });
-    this.protocolReady = Boolean(thermal);
-    if (thermal) {
-      this.diag('protocol', 'ok', 'A5 System + Thermal 均有响应');
-      this.diag('ready', 'ok', this.authState === 'server-auth-not-reproduced' ? '兼容打印通道就绪；官方服务器鉴权未复现' : 'A5 兼容打印就绪');
-    } else {
-      this.diag('protocol', 'warn', 'System 握手成功，但 Thermal 05/0F 无响应');
-      this.diag('ready', 'error', '暂不发送打印数据');
-    }
+    this.officialReady = false;
+    this.diag('official', 'warn', '尚未复现 deviceAuth → server response(code/sign) → 01/1F device verification → doConnSuccess → heartbeat 闭环');
+    await this.probeCompatibilityThermal();
+    this.diag('ready', this.compatReady ? 'warn' : 'error', this.compatReady
+      ? '兼容打印通道就绪；官方 onDevConnSuccess 尚未验证'
+      : '官方握手可达，但 Auth/打印兼容通道尚未就绪');
   }
 
   async rerunDiagnostics() {
@@ -204,14 +254,13 @@ export class PaperangWebTransport extends EventTarget {
     if (this.profile !== 'p2-a5') return { ready: this.ready, profile: this.profile };
     this.a5Parser.reset();
     await this.initializeA5Connection();
-    return { ready: this.ready, profile: this.profile, authState: this.authState, deviceInfo: { ...this.deviceInfo } };
+    return { ready: this.ready, profile: this.profile, officialReady: this.officialReady, compatReady: this.compatReady, authState: this.authState, deviceInfo: { ...this.deviceInfo } };
   }
 
   async ensureProtocolReady() {
     if (this.profile !== 'p2-a5') return this.ready;
-    if (this.protocolReady) return true;
-    const response = await this.queryA5(A5.STATUS_PAYLOAD, { domain: A5.DOMAIN_THERMAL, command: 0x0f, timeout: this.isIOS ? 1300 : 900 });
-    this.protocolReady = Boolean(response); return this.protocolReady;
+    if (this.compatReady) return true;
+    return this.probeCompatibilityThermal();
   }
 
   async detectProfile() {
@@ -231,12 +280,19 @@ export class PaperangWebTransport extends EventTarget {
     return { profile: 'p1', write, notify };
   }
 
-  async disconnect() { try { if (this.device?.gatt?.disconnect) this.device.gatt.disconnect(); } finally { this.reset(); } }
-  onDisconnected() { this.emit('log', '设备已断开'); this.reset(); this.emit('disconnected', {}); }
-  reset(clearDevice = true) {
+  async disconnect() {
+    this.lastDiagnosticReport = this.currentDiagnosticReport('manual-disconnect');
+    try { if (this.device?.gatt?.disconnect) this.device.gatt.disconnect(); } finally { this.reset(true, true); }
+  }
+  onDisconnected() {
+    this.lastDiagnosticReport = this.currentDiagnosticReport('gatt-disconnected');
+    this.emit('log', '设备已断开'); this.reset(true, true); this.emit('disconnected', { diagnosticAvailable: true });
+  }
+  reset(clearDevice = true, preserveDiagnostic = false) {
     for (const w of this.a5Waiters) { clearTimeout(w.timer); w.resolve(null); }
     this.a5Waiters.clear(); this.a5Parser.reset(); this.server = null; this.profile = null; this.writeChar = null; this.notifyChars = [];
-    this.sessionConnected = false; this.protocolReady = false; this.deviceInfo = {}; this.handshake = null; this.authState = 'unknown';
+    this.sessionConnected = false; this.protocolReady = false; this.compatReady = false; this.officialReady = false; this.deviceInfo = {}; this.handshake = null; this.authState = 'unknown';
+    if (!preserveDiagnostic) { this.diagnostics = {}; this.rxHistory = []; this.a5History = []; this.lastDiagnosticReport = null; }
     if (clearDevice) this.device = null;
   }
 

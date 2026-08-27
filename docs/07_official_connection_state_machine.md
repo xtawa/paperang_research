@@ -1,207 +1,81 @@
-# Official-app BLE connection state machine (APK reconstruction)
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  A5, CRC_SEED, P1, a5PrintChunkSize, buildA5PrintDataPayload, crc32, hex,
+  A5StreamParser, buildHandshakeNoParamsRequest, buildHandshakeRequest, buildSystemRequest, parseA5Payload, parseTlvArgs,
+  packA5Frame, packP1Frame, parseA5Frame, p1RegistrationFrame,
+} from '../web/src/protocol.js';
+import { packBinaryPixels, thresholdPixels } from '../web/src/raster.js';
 
-This note narrows the gap between the earlier raw-print interoperability path and the connection lifecycle implemented by the current Android APK.
+test('CRC32 matches Paperang fixed registration packet', () => {
+  assert.equal(CRC_SEED, 0x35769521);
+  assert.equal(crc32(Uint8Array.from([0x21,0x95,0x76,0x35])), 0x2144df1c);
+  assert.equal(hex(p1RegistrationFrame()), '0218000400219576351cdf442103');
+});
 
-## Confidence model
+test('P1 frame encodes command/index/LE length/payload/CRC/tail', () => {
+  const frame = packP1Frame(P1.SET_DENSITY, Uint8Array.from([75]), 3);
+  assert.equal(frame[0], 0x02); assert.equal(frame[1], 0x19); assert.equal(frame[2], 3);
+  assert.equal(frame[3], 1); assert.equal(frame[4], 0); assert.equal(frame.at(-1), 0x03);
+});
 
-The APK is protected by Tencent Legu. The ten protected DEX streams can be decompressed and their DEX metadata is intact, but protected method instruction arrays are zeroed/NOP-filled. Therefore:
+test('A5 known start frame and parser', () => {
+  const frame = packA5Frame(A5.START_RASTER_PAYLOAD);
+  assert.equal(hex(frame), 'a5010500051901000039cb63a65a');
+  const parsed = parseA5Frame(frame);
+  assert.ok(parsed); assert.deepEqual([...parsed.payload], [...A5.START_RASTER_PAYLOAD]);
+});
 
-- **APK-confirmed** means class/field/method signature or encoded static constant is directly present in recovered DEX metadata.
-- **Strongly inferred** means ordering is reconstructed from callback classes, captured anonymous-class fields, matching method signatures, and public packet evidence, but not from executable Java bytecode.
-- **Runtime-needed** means a live device capture is still required before treating behavior as universal.
+test('A5 P2 chunking stays row aligned and under validated frame budget', () => {
+  assert.equal(a5PrintChunkSize(72), 144);
+  const payload = buildA5PrintDataPayload(new Uint8Array(144), 1, 72, false);
+  const frame = packA5Frame(payload);
+  assert.ok(frame.length <= 237);
+});
 
-## `BleManager` does not equate GATT with printer-ready
+test('raster packs black=1 MSB first', () => {
+  const bits = Uint8Array.from([1,0,1,0,0,0,0,1]);
+  assert.deepEqual([...packBinaryPixels(bits, 8, 1)], [0xa1]);
+  assert.deepEqual([...thresholdPixels(Uint8Array.from([0,255]), 128, false)], [1,0]);
+});
 
-`com.paperang.libprinter.printer.connect.ble.manage.BleManager` contains its own `isConnected` state, a request queue, a heartbeat helper, current `DeviceInfo`, and separate callbacks for physical/device lifecycle.
 
-The public SDK callback `OnDevConnStatusListener` exposes distinct stages:
+test('APK-confirmed A5 System 01/17 handshake frame matches captured layout', () => {
+  const frame = packA5Frame(buildHandshakeRequest('P4sdFat2pBd0h4mh'));
+  assert.equal(hex(frame), 'a5011800011701130001100050347364466174327042643068346d687c3eb3c95a');
+  const parsed = parseA5Payload(parseA5Frame(frame));
+  assert.equal(parsed.domain, 0x01);
+  assert.equal(parsed.command, 0x17);
+  assert.equal(parsed.kind, 0x01);
+  assert.equal(parsed.tlv.values[0].tag, 0x01);
+  assert.equal(parsed.tlv.values[0].text, 'P4sdFat2pBd0h4mh');
+});
 
-- `onGetDevInfoStart()`
-- `onGetDevInfoSuccess(DeviceInfo)`
-- `onGetDevInfoFailed(GetDeviceInfoError)`
-- `onAuthStart()`
-- `onAuthSuccess()`
-- `onDeviceShakeFailed()`
-- `onDevVerificationFailed(...)`
-- `onDevConnSuccess(DeviceInfo, int, String, String)`
-- `onDevConnFailed(...)`
-- `onDevConnTimeout()`
+test('A5 stream parser reassembles fragmented notifications and skips BLE noise', () => {
+  const parser = new A5StreamParser();
+  const one = packA5Frame(buildSystemRequest(A5.SYS_PROTOCOL_VERSION));
+  const two = packA5Frame(buildSystemRequest(A5.SYS_SN));
+  assert.equal(parser.push(Uint8Array.from([0x01, 0x04, ...one.slice(0, 5)])).length, 0);
+  const frames = parser.push(Uint8Array.from([...one.slice(5), ...two]));
+  assert.equal(frames.length, 2);
+  assert.equal(parseA5Payload(frames[0]).command, A5.SYS_PROTOCOL_VERSION);
+  assert.equal(parseA5Payload(frames[1]).command, A5.SYS_SN);
+});
 
-This is direct evidence that a successful Android `BluetoothGatt.connect()` is only an early transport stage.
+test('TLV parser handles multiple handshake response fields', () => {
+  const bytes = Uint8Array.from([1,2,0,65,66, 2,3,0,120,121,122]);
+  const parsed = parseTlvArgs(bytes);
+  assert.equal(parsed.complete, true);
+  assert.equal(parsed.values[0].text, 'AB');
+  assert.equal(parsed.values[1].text, 'xyz');
+});
 
-## High-confidence lifecycle
 
-The following `BleManager` methods are APK-confirmed:
-
-```text
-connectLeDevice(...)
-onGattSuccess(...)
-shakeHand()
-afterShakeHand(String, String, String, String)
-deviceAuth(String, String, String, String, OnDeviceAuthResultListener)
-authInServer(String, String, String, String)
-afterAuthSuccess(boolean, int, String, String)
-queryInfoNecessary(int, String, String)
-queryCanCacheInfo(int, String, String)
-doConnSuccess(int, String, String)
-netPingPong()
-pausePingPong()
-```
-
-The callback structure gives additional ordering evidence:
-
-- `BleManager$8.onDevHandShakeReceived(String,String,String,String)` is the normal handshake callback.
-- `BleManager$6.onDevSwVersionReceived(...)` captures `deviceSN`, `randomCode`, `md5`, and `authCode`.
-- `BleManager$7` is a `TimeoutHelper` capturing those same four values plus `haCache`; its nested callback implements `OnDeviceAuthResultListener`.
-- later callbacks for device type, max length, SN, battery, protocol version, and max cache carry the `(code, md5, randomCode)` values used by `queryInfoNecessary(...)` / `doConnSuccess(...)`.
-
-A conservative reconstruction is therefore:
-
-```text
-GATT connect
-  -> service/characteristic discovery
-  -> enable notifications
-  -> onGattSuccess
-  -> shakeHand
-  -> get SW version
-  -> deviceAuth / authInServer (or an allowed skip path)
-  -> queryInfoNecessary / queryCanCacheInfo
-  -> populate DeviceInfo
-  -> doConnSuccess
-  -> heartbeat/ping-pong
-  -> printer ready
-```
-
-Some exact branch ordering remains runtime-needed because protected method bodies are unavailable.
-
-## A5 System handshake is `01/17`
-
-`Protocol_A5` encoded static constants recover exactly as:
-
-```text
-data_function_parent_system              = 0x01
-data_system_child_req_shake_hand         = 0x17
-data_system_child_set_dev_key            = 0x18
-data_system_child_notice_shake_hand_result = 0x1F
-MM_SYS_GET_PROTOCOL_VER                  = 0x15
-```
-
-The SDK exposes both:
-
-```text
-getSystemDeviceShakeHand(listener)
-getSystemDeviceShakeHand_NoParams(listener)
-setSystemDeviceKey(...)
-setSystemDeviceNoticeShakeHand(...)
-```
-
-A challenge-form handshake uses the already-established A5 frame and TLV conventions:
-
-```text
-A5 01 | payload_len_le16 |
-01 17 01 13 00 | 01 10 00 | <16 ASCII challenge> |
-crc32(seed=0x35769521) | 5A
-```
-
-For challenge `P4sdFat2pBd0h4mh`, the byte-exact frame is:
-
-```text
-a5011800011701130001100050347364466174327042643068346d687c3eb3c95a
-```
-
-The CRC is independently reproducible.
-
-## Read-only System queries recovered from APK constants
-
-Useful System-domain request command values include:
-
-| Purpose | Domain/command |
-|---|---|
-| Device info | `01/01` |
-| Serial number | `01/02` |
-| Software version | `01/07` |
-| Product/model | `01/08` |
-| Battery | `01/0B` |
-| Max data length | `01/14` |
-| Protocol version | `01/15` |
-| Shake hand | `01/17` |
-| Set device key | `01/18` |
-| Handshake-result notice | `01/1F` |
-| Max package/cache count | `01/20` |
-
-`DeviceInfo` independently contains `devSN`, `devType`, `devVersion`, `devMaxLen`, `devMaxCache`, `protocol`, and `protocolVersion`, consistent with these queries.
-
-## Device authorization
-
-The APK exposes:
-
-```text
-DeviceAuthRequest:
-  deviceSN
-  rcode
-  sign
-  code
-
-DeviceAuthResponse:
-  code
-  sign
-```
-
-`BleManager.deviceAuth(...)` takes four strings; the handshake callback names those captured values as `deviceSN`, `randomCode`, `md5`, `authCode`. This strongly suggests the request mapping:
-
-```text
-deviceSN <- deviceSN
-rcode    <- randomCode
-sign     <- md5
-code     <- authCode
-```
-
-The SDK also contains route string `/api/device/auth`. `MBHttpConfig.RELEASE_BASE_URL` is `https://mo.paperang.com/` and the network layer contains access-token/app identity fields. The web client deliberately does **not** forge or bypass this server authorization. A live device may use an auth-skip path (`CommonManager.canSkippAuth*`) or may require official server/account state.
-
-## Why the first web readiness probe could falsely fail on iOS
-
-The APK has `ProtocolParser` stream state and temporary bytes, showing that transport reads are not packet boundaries. The earlier web implementation called `parseA5Frame()` directly on each BLE notification. That fails whenever CoreBluetooth/Bluefy delivers one A5 response as multiple notification fragments.
-
-The web client now has an `A5StreamParser` that:
-
-1. accumulates arbitrary notification fragments;
-2. searches for `A5 01` sync;
-3. reads the little-endian payload length;
-4. waits until the whole frame is buffered;
-5. validates tail and seeded CRC32;
-6. emits complete frames;
-7. supports multiple frames in a single notification;
-8. ignores unrelated short BLE status notifications.
-
-Queries now match replies by A5 `domain + command`, rather than accepting the first arbitrary A5 packet.
-
-## Current web diagnostic sequence
-
-For FF00/A5 devices the browser now attempts:
-
-```text
-BLE GATT
- -> FF00 / FF02 profile discovery
- -> subscribe FF01 / FF03 notifications
- -> A5 stream reassembly enabled
- -> System 01/17 challenge handshake
- -> fallback: System 01/17 no-parameter handshake
- -> System 01/07 SW version
- -> identify whether handshake exposes auth material
- -> read-only queries: type, maxLen, SN, battery, protocolVersion, maxCache
- -> Thermal 05/0F non-printing readiness probe
- -> only then enable Print
-```
-
-If the handshake succeeds but auth material is returned, the UI marks server auth as not reproduced instead of pretending the official `onDevConnSuccess` state was reached.
-
-## Remaining runtime questions
-
-A capture from a failing/working device is still needed to determine:
-
-1. exact TLV tag-to-field mapping of the four handshake callback strings;
-2. which device/firmware families call the no-parameter handshake variant;
-3. exact `canSkippAuth` conditions;
-4. whether server auth is mandatory for the user's unit or only for binding/cloud features;
-5. whether `01/1F` is required before thermal printing on authenticated devices;
-6. exact protocol-selection behavior for devices exposing FF00 but ultimately using 02/07/17 or another transport.
+test('A5 no-parameter handshake stays a System 01/17 request', () => {
+  const frame = packA5Frame(buildHandshakeNoParamsRequest());
+  const parsed = parseA5Payload(parseA5Frame(frame));
+  assert.equal(parsed.domain, A5.DOMAIN_SYSTEM);
+  assert.equal(parsed.command, A5.SYS_SHAKE_HAND);
+  assert.equal(parsed.kind, A5.TYPE_REQUEST);
+  assert.equal(parsed.args.length, 0);
+});

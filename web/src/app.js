@@ -11,7 +11,7 @@ const ui = {
   density: $('density'), densityValue: $('densityValue'), feedMm: $('feedMm'), gattChunk: $('gattChunk'), log: $('log'),
   meta: $('imageMeta'), progress: $('progress'), clearLog: $('clearLog'), exportRaster: $('exportRaster'),
   mobileConnect: $('mobileConnectProxy'), mobilePrint: $('mobilePrintProxy'), paperWidthLabel: $('paperWidthLabel'),
-  diagSummary: $('diagSummary'), diagList: $('diagList'), deviceInfoPanel: $('deviceInfoPanel'), rerunDiag: $('rerunDiagBtn'),
+  diagSummary: $('diagSummary'), diagList: $('diagList'), deviceInfoPanel: $('deviceInfoPanel'), rerunDiag: $('rerunDiagBtn'), exportDiag: $('exportDiagBtn'),
 };
 
 const transport = new PaperangWebTransport();
@@ -39,13 +39,16 @@ function resetDiagnostics() {
   if (ui.diagSummary) ui.diagSummary.textContent = '等待连接';
   if (ui.deviceInfoPanel) ui.deviceInfoPanel.textContent = '尚未读取设备信息';
   if (ui.rerunDiag) ui.rerunDiag.disabled = true;
+  if (ui.exportDiag) ui.exportDiag.disabled = true;
 }
 function renderDeviceInfo(info = {}, authState = '') {
   if (!ui.deviceInfoPanel) return;
   const lines = [];
-  const labels = { softwareVersion: 'SW', deviceType: 'Type', sn: 'SN', snHandshake: 'Handshake SN', battery: 'Battery', protocolVersion: 'Protocol', maxLen: 'MaxLen', maxCache: 'MaxCache' };
+  const labels = { softwareVersion: 'SW', deviceType: 'Type', sn: 'SN', battery: 'Battery', protocolVersion: 'Protocol', maxLen: 'MaxLen', maxCache: 'MaxCache' };
   for (const [key, label] of Object.entries(labels)) if (info[key] !== undefined && info[key] !== null && String(info[key]) !== '') lines.push(`${label}: ${info[key]}`);
   if (authState) lines.push(`Auth: ${authState}`);
+  lines.push(`Official ready: ${transport.officialReady ? 'yes' : 'no'}`);
+  lines.push(`Compat ready: ${transport.compatReady ? 'yes' : 'no'}`);
   ui.deviceInfoPanel.textContent = lines.length ? lines.join('\n') : '设备已连接，尚未解析到 System 信息';
 }
 function updateDiagnostic(detail) {
@@ -59,6 +62,7 @@ function updateDiagnostic(detail) {
   }
   if (ui.diagSummary) ui.diagSummary.textContent = detail.detail || `${detail.stage}: ${diagLabels[detail.state] || detail.state}`;
   renderDeviceInfo(detail.deviceInfo || {}, detail.authState || '');
+  if (ui.exportDiag) ui.exportDiag.disabled = false;
 }
 
 function selectedWidth() {
@@ -154,18 +158,18 @@ async function connect() {
     const result = await transport.requestAndConnect();
     ui.disconnect.disabled = false; ui.feed.disabled = !result.ready;
     if (ui.rerunDiag) ui.rerunDiag.disabled = result.profile !== 'p2-a5';
-    if (ui.mobileConnect) ui.mobileConnect.innerHTML = result.ready
-      ? '<span class="dock-icon">✓</span><span>已就绪</span>'
-      : '<span class="dock-icon">!</span><span>已连接</span>';
+    if (ui.mobileConnect) ui.mobileConnect.innerHTML = result.compatReady
+      ? '<span class="dock-icon">✓</span><span>兼容就绪</span>'
+      : '<span class="dock-icon">!</span><span>仅 GATT</span>';
     ui.selfTest.disabled = result.profile !== 'p1' || !result.ready;
     ui.profile.disabled = true;
     renderDeviceInfo(result.deviceInfo || {}, result.authState || '');
-    if (result.ready) {
-      setStatus(`已连接 ${result.name} · 打印通道就绪`, 'ok');
-      log(`连接成功：${result.name} · ${result.profile} · protocol ready`);
+    if (result.compatReady) {
+      setStatus(`已连接 ${result.name} · 兼容打印通道就绪`, 'ok');
+      log(`连接成功：${result.name} · ${result.profile} · compat ready · official=${Boolean(result.officialReady)}`);
     } else {
-      setStatus(`已连接 ${result.name} · 查看连接诊断`, 'error');
-      log(`GATT 已连接：${result.name} · ${result.profile}，初始化未完成；请查看连接诊断`);
+      setStatus(`已连接 ${result.name} · 仅 GATT / 查看诊断`, 'error');
+      log(`GATT 已连接：${result.name} · ${result.profile}，官方/兼容初始化未完成；请导出诊断 JSON`);
     }
     updateProfileUi();
     if (result.ready) {
@@ -200,7 +204,10 @@ transport.addEventListener('disconnected', () => {
   if (ui.mobilePrint) ui.mobilePrint.disabled = true;
   if (ui.mobileConnect) ui.mobileConnect.innerHTML = '<span class="dock-icon">⌁</span><span>连接</span>';
   if (ui.rerunDiag) ui.rerunDiag.disabled = true;
-  setStatus('未连接'); resetDiagnostics(); updateProfileUi();
+  setStatus('设备已断开 · 可导出上次诊断', 'error');
+  if (ui.diagSummary) ui.diagSummary.textContent = '设备已断开，诊断数据已保留';
+  if (ui.exportDiag) ui.exportDiag.disabled = false;
+  updateProfileUi();
 });
 
 ui.file.addEventListener('change', () => loadFile(ui.file.files[0]).catch((e) => { setStatus(e.message, 'error'); log(e.message); }));
@@ -218,12 +225,24 @@ ui.rerunDiag?.addEventListener('click', async () => {
     renderDeviceInfo(result.deviceInfo || {}, result.authState || '');
     ui.feed.disabled = !result.ready;
     if (raster) { ui.print.disabled = !result.ready; if (ui.mobilePrint) ui.mobilePrint.disabled = !result.ready; }
-    if (ui.mobileConnect) ui.mobileConnect.innerHTML = result.ready
-      ? '<span class="dock-icon">✓</span><span>已就绪</span>'
-      : '<span class="dock-icon">!</span><span>已连接</span>';
-    setStatus(result.ready ? 'A5 打印通道已就绪' : '诊断完成 · 打印通道仍未就绪', result.ready ? 'ok' : 'error');
+    if (ui.mobileConnect) ui.mobileConnect.innerHTML = result.compatReady
+      ? '<span class="dock-icon">✓</span><span>兼容就绪</span>'
+      : '<span class="dock-icon">!</span><span>仅 GATT</span>';
+    setStatus(result.compatReady ? '兼容 A5 打印通道已就绪 · 官方状态见诊断' : '诊断完成 · 打印通道仍未就绪', result.compatReady ? 'ok' : 'error');
   } catch (e) { setStatus(`诊断失败：${e.message}`, 'error'); log(`诊断失败：${e.stack || e.message}`); }
   finally { ui.rerunDiag.disabled = !transport.connected || transport.profile !== 'p2-a5'; }
+});
+
+ui.exportDiag?.addEventListener('click', () => {
+  try {
+    const report = transport.getDiagnosticReport();
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob); const a = document.createElement('a');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    a.href = url; a.download = `paperang-diagnostic-${stamp}.json`; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    log('已导出连接诊断 JSON（不包含 Paperang 账号 Token/App Secret；设备回包可能包含设备 SN）');
+  } catch (e) { log(`导出诊断失败：${e.message}`); }
 });
 ui.clearLog.addEventListener('click', () => { ui.log.textContent = ''; });
 ui.exportRaster.addEventListener('click', () => {
