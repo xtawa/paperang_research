@@ -4,6 +4,12 @@ Reverse-engineering notes for a recent `cn.paperang.mm.apk`, focused on **how th
 
 This repository contains reproducible analysis scripts, protocol constants recovered from the APK, and a practical protocol-0x02 tutorial. It deliberately does **not** redistribute the proprietary APK, decrypted application DEX files, or native binaries.
 
+## Online Web Printer
+
+**Production:** https://paperang-research.vercel.app
+
+The Vercel deployment is HTTPS-enabled and uses a responsive interface for desktop and mobile. Desktop Chrome/Edge and Android Chromium browsers are the primary Web Bluetooth targets. iPhone/iPad Safari does not provide native Web Bluetooth support.
+
 ## Main findings
 
 1. **The APK is protected by a Tencent-Legu-style shell (`libshella-4.6.2.2.so`).** The visible DEX files are only tiny shell stubs. The protected asset `assets/0OO00l111l1l` contains ten NRV2D-compressed DEX skeletons. They can be recovered without executing the app, but protected method instructions remain NOP-ed.
@@ -32,14 +38,14 @@ This repository contains reproducible analysis scripts, protocol constants recov
 
 ## Web printer
 
-A working browser printer is included at the repository root: [`index.html`](index.html). Serve the repository through HTTPS (GitHub Pages is suitable), open it in Chrome/Edge or Android Chromium, upload an image, connect the printer, tune the binary preview, and print directly over Web Bluetooth.
+A working browser printer is included at the repository root: [`index.html`](index.html). The production version is deployed at **https://paperang-research.vercel.app**. Upload an image, connect the printer, tune the binary preview, and print directly over Web Bluetooth.
 
 The web client auto-detects two independently supported paths:
 
 - **P1 / Protocol 0x02** — 384 px, `49535343...` GATT service, both known write-characteristic variants.
 - **P2 / FF00 + A5** — 576 px, `FF02` write + `FF01/FF03` notify, A5 raster packet sequence.
 
-It includes threshold, Floyd–Steinberg and Atkinson conversion, rotation, width scaling, density, post-print feed, binary export, RX logging, and row-aligned protocol chunking. All image processing stays local in the browser. See [`docs/05_web_printer.md`](docs/05_web_printer.md) and [`docs/06_protocol_cross_validation_2026.md`](docs/06_protocol_cross_validation_2026.md).
+It includes threshold, Floyd–Steinberg and Atkinson conversion, rotation, width scaling, density, post-print feed, binary export, RX logging, and row-aligned protocol chunking. All image processing stays local in the browser. The responsive UI uses a two-column control/preview workspace on desktop and a single-column workflow with a safe-area-aware bottom Connect/Print dock on mobile. See [`docs/05_web_printer.md`](docs/05_web_printer.md) and [`docs/06_protocol_cross_validation_2026.md`](docs/06_protocol_cross_validation_2026.md).
 
 Run browser-protocol unit tests with:
 
