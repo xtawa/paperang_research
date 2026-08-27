@@ -11,7 +11,11 @@ Two independent public implementations use the same proprietary `49535343-fe7d-4
 | historical browser implementation | `49535343-6daa-4d02-abf6-19569aca69fe` |
 | current `paperang-cli` P1 driver | `49535343-8841-43f4-a8d4-ecbe34729bb3` |
 
-The web client therefore enumerates the service and supports both, falling back to any characteristic whose GATT properties report write/write-without-response.
+The web client therefore enumerates the service and probes both in this order:
+`6DAA` (the public browser reference), then `8841` (the newer Bleak driver),
+then any remaining characteristic whose GATT properties report write or
+write-without-response. Known UUIDs are still probed when a browser reports an
+incomplete all-false properties object.
 
 The current P1 driver also cross-validates:
 
@@ -20,6 +24,11 @@ The current P1 driver also cross-validates:
 - Bluetooth command numbers recovered from the APK
 - 384 px head
 - post-connect density/status queries
+
+Its automatic CRC-key registration is treated as a transport-specific SPP/Bleak
+variant. It is not copied into the browser default path because the independent
+WebBLE reference sends standard-seed frames directly and never registers a
+session key.
 
 ## P2 is not one transport family
 
@@ -88,6 +97,22 @@ print-data frame overhead = 26
 max raster <= 211
 row aligned chunk = floor(211/72)*72 = 144 bytes = 2 rows
 ```
+
+## Browser-path audit result
+
+The first browser implementation mixed two independent behaviors: it sent a
+session-style `SET_CRC_KEY` packet, kept using the standard CRC afterward, and
+split a 490-byte P1 raster frame using the generic 237-byte A5 write budget.
+The current web transport separates those states:
+
+- direct WebBLE: standard CRC, no automatic registration, verified read-only
+  probe, stream parser, full-frame writes up to 512 bytes;
+- session variant: explicit `registerP1SessionCrc()` call, then session CRC for
+  later frames, with the state exposed in diagnostics.
+
+The code now records exact characteristic, GATT properties, write method,
+frame length, and TX/RX hex. Physical output is still the acceptance test for
+the device-specific write characteristic and feed/raster semantics.
 
 ## Remaining unknowns
 

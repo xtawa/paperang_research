@@ -21,6 +21,8 @@ from protocol02 import (
     PRT_FEED_LINE,
     PRT_PRINT_DATA,
     PRT_SET_HEAT_DENSITY,
+    SESSION_CRC_KEY,
+    STANDARD_CRC_KEY,
     iter_frames,
     pack_frame,
     register_crc_key_frame,
@@ -77,17 +79,22 @@ async def main(args) -> None:
         except Exception as exc:
             print("notify unavailable:", exc)
 
-        await write_stream(client, register_crc_key_frame(), args.att_chunk)
-        await asyncio.sleep(0.05)
-        await write_stream(client, pack_frame(PRT_SET_HEAT_DENSITY, bytes([args.density])), args.att_chunk)
+        crc_key = STANDARD_CRC_KEY
+        if args.session_crc:
+            await write_stream(client, register_crc_key_frame(args.session_key), args.att_chunk)
+            crc_key = args.session_key
+            await asyncio.sleep(0.05)
+            print(f"registered session CRC key: 0x{crc_key:08x}")
+
+        await write_stream(client, pack_frame(PRT_SET_HEAT_DENSITY, bytes([args.density]), crc_key=crc_key), args.att_chunk)
         await asyncio.sleep(0.05)
 
-        for frame in iter_frames(PRT_PRINT_DATA, raster, PROTOCOL_PAYLOAD_CHUNK):
+        for frame in iter_frames(PRT_PRINT_DATA, raster, PROTOCOL_PAYLOAD_CHUNK, crc_key=crc_key):
             await write_stream(client, frame, args.att_chunk)
             await asyncio.sleep(args.frame_delay)
 
         # 210 pixels is the value used by the public WebBLE reference.
-        await write_stream(client, pack_frame(PRT_FEED_LINE, bytes([210])), args.att_chunk)
+        await write_stream(client, pack_frame(PRT_FEED_LINE, bytes([210]), crc_key=crc_key), args.att_chunk)
         await asyncio.sleep(0.3)
 
 
@@ -97,6 +104,10 @@ if __name__ == "__main__":
     p.add_argument("image", type=Path)
     p.add_argument("--density", type=int, default=75)
     p.add_argument("--threshold", type=int, default=160)
+    p.add_argument("--session-crc", action="store_true",
+                   help="send SET_CRC_KEY and use the session key (SPP/Bleak variant)")
+    p.add_argument("--session-key", type=lambda value: int(value, 0), default=SESSION_CRC_KEY,
+                   help="session CRC key, accepted as decimal or 0x-prefixed hex")
     p.add_argument("--att-chunk", type=int, default=180,
                    help="max bytes per GATT write; reduce if the backend rejects writes")
     p.add_argument("--frame-delay", type=float, default=0.03)

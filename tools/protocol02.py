@@ -15,6 +15,10 @@ from typing import Iterable
 FRAME_HEAD = 0x02
 FRAME_TAIL = 0x03
 STANDARD_CRC_KEY = 0x35769521
+# The public SPP/Bleak implementations use this session key after sending
+# SET_CRC_KEY with (session_key ^ STANDARD_CRC_KEY) as the payload. The browser
+# WebBLE path intentionally does not register it by default.
+SESSION_CRC_KEY = 0x06B8EF59
 
 PRT_PRINT_DATA = 0x00
 PRT_GET_SN = 0x0A
@@ -91,14 +95,20 @@ def unpack_frame(frame: bytes, crc_key: int = STANDARD_CRC_KEY) -> Frame:
     return Frame(command, index, payload, crc, crc == crc32_seeded(payload, crc_key))
 
 
-def register_crc_key_frame(new_key: int = STANDARD_CRC_KEY) -> bytes:
+def register_crc_key_frame(session_key: int = SESSION_CRC_KEY) -> bytes:
     """Build the CRC-key registration frame.
 
-    The APK's default key is 0x35769521. Sending that value little-endian with
-    command 0x18 reproduces the well-known frame:
-      0218000400219576351cdf442103
+    Registration is a session-oriented transport operation, not part of the
+    default browser WebBLE path. The printer receives the session key XORed
+    with the standard key; the registration frame itself is CRC'd with the
+    standard key. The public SPP/Bleak session-key vector is:
+      0218000400787ace332c8980f003
+
+    To reproduce the older fixed-standard vector explicitly, call
+    ``register_crc_key_frame(STANDARD_CRC_KEY)``.
     """
-    payload = struct.pack("<I", new_key & 0xFFFFFFFF)
+    encoded = (session_key ^ STANDARD_CRC_KEY) & 0xFFFFFFFF
+    payload = struct.pack("<I", encoded)
     return pack_frame(PRT_SET_CRC_KEY, payload, 0, STANDARD_CRC_KEY)
 
 

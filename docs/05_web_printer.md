@@ -15,15 +15,31 @@ The repository root `index.html` is a dependency-free Web Bluetooth printer UI. 
 - protocol: `02 | cmd | index | lenLE16 | payload | CRC32LE | 03`
 - CRC seed: `0x35769521`
 - raster: black=1, white=0, MSB first
-- desktop path normally sends 10 full rows / 480 payload bytes per protocol frame; iOS/WebBLE mode uses smaller 3-row frames and slower writes
+- desktop path sends 10 full rows / 480 payload bytes as one complete 490-byte Protocol 02 frame; iOS/WebBLE mode uses smaller 3-row frames and slower writes
 
-On connect, the web app writes the cross-validated fixed CRC registration frame:
+The default browser path is direct WebBLE: it probes `GET_VERSION` with payload
+`01`, using the standard seed, and does not send `SET_CRC_KEY`. This keeps the
+browser behavior aligned with the public WebBLE reference rather than the
+classic-SPP/session-key implementations. P1 response notifications are parsed
+as a stream, so a response may be fragmented across notifications or contain
+multiple frames.
+
+The session registration path is explicit and diagnostic-only. Calling
+`registerP1SessionCrc()` writes the public session-key vector:
 
 ```text
-0218000400219576351cdf442103
+0218000400787ace332c8980f003
 ```
 
-It then uses the same seed for subsequent frames.
+and switches subsequent CRCs to the negotiated session key. The browser does
+not call this method automatically.
+
+Protocol 02 P1 frames up to 512 bytes are attempted as one GATT write. This is
+important for the 490-byte desktop raster frame: splitting it at the generic
+237-byte A5 budget would turn one printer frame into invalid protocol data. The
+[Web Bluetooth specification](https://webbluetoothcg.github.io/web-bluetooth/)
+defines a 512-byte maximum attribute value; individual devices/backends can
+still impose a smaller effective write limit.
 
 ### P2 / FF00 + A5
 
@@ -78,7 +94,8 @@ npm test
 The suite fixes two important regression vectors:
 
 ```text
-P1 CRC registration: 0218000400219576351cdf442103
+P1 direct WebBLE self-test: 021b0001000046895e9e03
+P1 opt-in session registration: 0218000400787ace332c8980f003
 P2 A5 start frame:   a5010500051901000039cb63a65a
 ```
 
@@ -99,3 +116,17 @@ If `01/17` official handshake fails, the browser still performs the independent 
 ## Connection diagnostic JSON
 
 The UI can export a `paperang-web-diagnostic-v1` JSON report containing stage status, characteristic UUIDs, raw BLE RX hex, reassembled A5 frames, ordered handshake TLVs, read-only device information, and a disconnect-time snapshot. It deliberately excludes Paperang account tokens, extracted APK app secrets, or other proprietary credentials. Printer responses can include a device serial number.
+
+## P1 diagnostic controls
+
+For a connected `Paperang_P1`, the diagnostics panel exposes:
+
+1. `GET_VERSION`, `GET_SN`, and `GET_BATTERY` probes with verified CRC parsing;
+2. a `P1 8 行黑条` action that sends 8 rows × 48 bytes of `0xff` raster;
+3. an exportable report containing the selected write characteristic, reported
+   properties, write method, frame-preservation status, and recent full TX/RX
+   frames.
+
+If the printer produces no paper, export the report before disconnecting. The
+key fields are `p1.probe`, `connection.writeCharacteristic`,
+`connection.lastWriteMethod`, and `p1.txHistory[*].framePreserved`.

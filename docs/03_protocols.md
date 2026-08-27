@@ -63,7 +63,8 @@ crcKey      = 0 initially
 
 `CRC16Util` carries the same standard-key value, indicating the value is a shared transport/protocol seed rather than an accidental constant.
 
-This resolves the known CRC registration frame:
+This reproduces the fixed-standard registration frame used as a historical
+vector:
 
 ```text
 02 18 00 04 00 21 95 76 35 1c df 44 21 03
@@ -88,6 +89,18 @@ Reproduction:
 >>> hex(zlib.crc32(bytes.fromhex("21957635"), 0x35769521) & 0xffffffff)
 '0x2144df1c'
 ```
+
+Some classic SPP/Bleak clients negotiate a session key instead. For
+`session_key = 0x06b8ef59`, they send `session_key XOR standardKey` as the
+four-byte payload, producing:
+
+```text
+0218000400787ace332c8980f003
+```
+
+The browser's default P1 WebBLE path does not send either registration frame;
+it uses the standard seed directly. Registration is exposed as an explicit
+diagnostic operation for firmware variants that require it.
 
 ### 2.4 Command table — APK-confirmed
 

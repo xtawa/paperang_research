@@ -39,8 +39,12 @@ python tools/protocol02.py
 Expected first line:
 
 ```text
-0218000400219576351cdf442103
+0218000400787ace332c8980f003
 ```
+
+This is the public SPP/Bleak session-key vector. The fixed-standard historical
+vector is available with `register_crc_key_frame(STANDARD_CRC_KEY)`; the
+browser WebBLE path does not register a key by default.
 
 Run the repository regression tests:
 
@@ -189,7 +193,8 @@ Before sending a large image, test small reversible queries:
 
 1. enumerate transport UUIDs / establish SPP;
 2. subscribe to notifications or start input stream;
-3. register/confirm CRC key if the device/protocol requires it;
+3. use standard CRC directly for WebBLE, or register a session key only if the
+   selected SPP/Bleak/device variant requires it;
 4. query battery (`0x10` for protocol 0x02);
 5. query SN/model/version;
 6. optionally print the built-in test page (`0x1B`);

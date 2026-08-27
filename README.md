@@ -27,13 +27,19 @@ The Vercel deployment is HTTPS-enabled and uses a responsive interface for deskt
    - set density `0x19`
    - feed line `0x1A`
    - power-down set/get `0x1E/0x1F`
-6. **CRC32 seed:** `0x35769521`. This independently explains the known registration packet:
+6. **CRC32 seed:** `0x35769521`. The default P1 WebBLE path uses this seed directly for every frame and does not send `SET_CRC_KEY`. Its self-test vector is:
 
    ```text
-   02 18 00 04 00 21 95 76 35 1c df 44 21 03
+   02 1b 00 01 00 00 46 89 5e 9e 03
    ```
 
-   The CRC over payload `21 95 76 35` with seed `0x35769521` is `0x2144df1c`, serialized little-endian as `1c df 44 21`.
+   Classic SPP and some Bleak P1 implementations instead negotiate a session key. Their registration packet encodes `session_key XOR 0x35769521`:
+
+   ```text
+   02 18 00 04 00 78 7a ce 33 2c 89 80 f0 03
+   ```
+
+   For the public session vector, `session_key = 0x06b8ef59`, the encoded payload is `78 7a ce 33` and the CRC is `0xf080892c`, serialized little-endian as `2c 89 80 f0`.
 7. **Printing is client-side raster printing, not Android's generic print service.** The app has bitmap-to-byte processing, threshold/grayscale paths, normal + 4/8/12/16-rank grayscale modes, then device/protocol-specific splitting and transport sending.
 
 ## Web printer
@@ -45,7 +51,7 @@ The web client auto-detects two independently supported paths:
 - **P1 / Protocol 0x02** — 384 px, `49535343...` GATT service, both known write-characteristic variants.
 - **P2 / FF00 + A5** — 576 px, `FF02` write + `FF01/FF03` notify, A5 raster packet sequence.
 
-It includes threshold, Floyd–Steinberg and Atkinson conversion, rotation, width scaling, density, post-print feed, binary export, RX logging, and row-aligned protocol chunking. All image processing stays local in the browser. The responsive UI uses a two-column control/preview workspace on desktop and a single-column workflow with a safe-area-aware bottom Connect/Print dock on mobile. See [`docs/05_web_printer.md`](docs/05_web_printer.md) and [`docs/06_protocol_cross_validation_2026.md`](docs/06_protocol_cross_validation_2026.md).
+It includes threshold, Floyd–Steinberg and Atkinson conversion, rotation, width scaling, density, post-print feed, binary export, RX logging, P1 frame reassembly, characteristic probing, and row-aligned protocol chunking. All image processing stays local in the browser. The responsive UI uses a two-column control/preview workspace on desktop and a single-column workflow with a safe-area-aware bottom Connect/Print dock on mobile. See [`docs/05_web_printer.md`](docs/05_web_printer.md), [`docs/06_protocol_cross_validation_2026.md`](docs/06_protocol_cross_validation_2026.md), and [`docs/08_p1_webble_audit.md`](docs/08_p1_webble_audit.md).
 
 Run browser-protocol unit tests with:
 
@@ -61,6 +67,7 @@ npm test
 - [`docs/04_reproduction.md`](docs/04_reproduction.md) — hands-on protocol and P1 BLE tutorial
 - [`docs/05_web_printer.md`](docs/05_web_printer.md) — Web Bluetooth printer implementation
 - [`docs/06_protocol_cross_validation_2026.md`](docs/06_protocol_cross_validation_2026.md) — newer P1/P2 hardware/protocol evidence
+- [`docs/08_p1_webble_audit.md`](docs/08_p1_webble_audit.md) — P1 WebBLE audit, evidence split, and real-device test matrix
 - [`evidence/apk_fingerprints.md`](evidence/apk_fingerprints.md) — hashes and exact sample structure
 - [`evidence/protocol_02_commands.csv`](evidence/protocol_02_commands.csv) — 98 command constants recovered from current APK metadata
 - [`tools/protocol02.py`](tools/protocol02.py) — frame/CRC implementation
@@ -85,8 +92,12 @@ python tools/protocol02.py
 Expected registration frame:
 
 ```text
-0218000400219576351cdf442103
+0218000400787ace332c8980f003
 ```
+
+The standard-seed registration vector remains available explicitly with
+`register_crc_key_frame(STANDARD_CRC_KEY)`. It is not sent by the default
+browser WebBLE path.
 
 For the full workflow, continue with [`docs/04_reproduction.md`](docs/04_reproduction.md).
 

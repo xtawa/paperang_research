@@ -11,7 +11,7 @@ const ui = {
   density: $('density'), densityValue: $('densityValue'), feedMm: $('feedMm'), gattChunk: $('gattChunk'), log: $('log'),
   meta: $('imageMeta'), progress: $('progress'), clearLog: $('clearLog'), exportRaster: $('exportRaster'),
   mobileConnect: $('mobileConnectProxy'), mobilePrint: $('mobilePrintProxy'), paperWidthLabel: $('paperWidthLabel'),
-  diagSummary: $('diagSummary'), diagList: $('diagList'), deviceInfoPanel: $('deviceInfoPanel'), rerunDiag: $('rerunDiagBtn'), exportDiag: $('exportDiagBtn'),
+  diagSummary: $('diagSummary'), diagList: $('diagList'), deviceInfoPanel: $('deviceInfoPanel'), p1TestPrint: $('p1TestPrintBtn'), rerunDiag: $('rerunDiagBtn'), exportDiag: $('exportDiagBtn'),
 };
 
 const transport = new PaperangWebTransport();
@@ -40,6 +40,7 @@ function resetDiagnostics() {
   if (ui.deviceInfoPanel) ui.deviceInfoPanel.textContent = '尚未读取设备信息';
   if (ui.rerunDiag) ui.rerunDiag.disabled = true;
   if (ui.exportDiag) ui.exportDiag.disabled = true;
+  if (ui.p1TestPrint) ui.p1TestPrint.disabled = true;
 }
 
 function modelName() {
@@ -185,6 +186,7 @@ async function connect() {
     const result = await transport.requestAndConnect();
     ui.disconnect.disabled = false; ui.feed.disabled = !result.ready;
     if (ui.rerunDiag) ui.rerunDiag.disabled = result.profile !== 'p2-a5';
+    if (ui.p1TestPrint) ui.p1TestPrint.disabled = result.profile !== 'p1' || !result.ready;
     if (ui.mobileConnect) ui.mobileConnect.innerHTML = result.compatReady
       ? '<span class="dock-icon">✓</span><span>兼容就绪</span>'
       : '<span class="dock-icon">!</span><span>仅 GATT</span>';
@@ -293,6 +295,7 @@ transport.addEventListener('log', (e) => log(e.detail));
 transport.addEventListener('diagnostic', (e) => updateDiagnostic(e.detail));
 transport.addEventListener('disconnected', () => {
   ui.connect.disabled = false; ui.disconnect.disabled = true; ui.print.disabled = true; ui.feed.disabled = true; ui.selfTest.disabled = true; ui.profile.disabled = false;
+  if (ui.p1TestPrint) ui.p1TestPrint.disabled = true;
   if (ui.mobilePrint) ui.mobilePrint.disabled = true;
   if (ui.mobileConnect) ui.mobileConnect.innerHTML = '<span class="dock-icon">⌁</span><span>连接</span>';
   if (ui.rerunDiag) ui.rerunDiag.disabled = true;
@@ -310,12 +313,25 @@ ui.mobileConnect?.addEventListener('click', () => transport.connected ? transpor
 ui.mobilePrint?.addEventListener('click', print);
 ui.feed.addEventListener('click', async () => { try { await transport.feed(ui.feedMm.value, outputWidth / 8); log(`走纸 ${ui.feedMm.value} mm`); } catch (e) { log(`走纸失败：${e.message}`); } });
 ui.selfTest.addEventListener('click', async () => { try { await transport.selfTest(); log('已发送 P1 自检命令'); } catch (e) { log(`自检失败：${e.message}`); } });
+ui.p1TestPrint?.addEventListener('click', async () => {
+  try {
+    ui.p1TestPrint.disabled = true;
+    setStatus('正在发送 P1 8 行黑条诊断…');
+    await transport.printP1DiagnosticRows(8, 5);
+    setStatus('P1 8 行黑条已发送 · 请观察出纸和通信日志', 'ok');
+    log('P1 8 行黑条发送完成（仅 384 bytes raster）');
+  } catch (e) {
+    setStatus(`P1 诊断打印失败：${e.message}`, 'error');
+    log(`P1 诊断打印失败：${e.stack || e.message}`);
+  } finally { ui.p1TestPrint.disabled = transport.profile !== 'p1' || !transport.ready; }
+});
 ui.rerunDiag?.addEventListener('click', async () => {
   try {
     ui.rerunDiag.disabled = true; setStatus('正在重新执行官方连接诊断…');
     const result = await transport.rerunDiagnostics();
     renderDeviceInfo(result.deviceInfo || {}, result.authState || '');
     ui.feed.disabled = !result.ready;
+    if (ui.p1TestPrint) ui.p1TestPrint.disabled = result.profile !== 'p1' || !result.ready;
     if (raster) { ui.print.disabled = !result.ready; if (ui.mobilePrint) ui.mobilePrint.disabled = !result.ready; }
     if (ui.mobileConnect) ui.mobileConnect.innerHTML = result.compatReady
       ? '<span class="dock-icon">✓</span><span>兼容就绪</span>'

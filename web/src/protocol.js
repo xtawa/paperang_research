@@ -72,12 +72,105 @@ export function packP1Frame(command, payload = new Uint8Array(), packetIndex = 0
     u32le(crc32(data, seed)), new Uint8Array([P1.TAIL]));
 }
 
+/**
+ * Parse one complete Protocol 02 frame.
+ *
+ * The CRC is over the payload only.  A structurally valid frame is returned
+ * even when its CRC does not match so callers can log the frame and resync;
+ * `crcOk` is the field that decides whether it may be used as a response.
+ */
+export function parseP1Frame(packet, seed = CRC_SEED) {
+  const p = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
+  if (p.length < 10 || p[0] !== P1.HEAD || p[p.length - 1] !== P1.TAIL) return null;
+  const payloadLength = p[3] | (p[4] << 8);
+  const total = 10 + payloadLength;
+  if (p.length !== total) return null;
+  const payload = p.slice(5, 5 + payloadLength);
+  const crcOffset = 5 + payloadLength;
+  const crc = (p[crcOffset] | (p[crcOffset + 1] << 8) | (p[crcOffset + 2] << 16) | (p[crcOffset + 3] << 24)) >>> 0;
+  const expectedCrc = crc32(payload, seed);
+  return {
+    raw: p,
+    command: p[1],
+    packetIndex: p[2],
+    payloadLength,
+    payload,
+    crc,
+    expectedCrc,
+    crcSeed: seed >>> 0,
+    crcOk: crc === expectedCrc,
+  };
+}
+
 export function p1RegistrationFrame(sessionKey = P1_SESSION_CRC_KEY) {
   // The printer receives (sessionKey XOR standardKey), while this registration
   // packet itself is still CRC'd with the standard key. Subsequent packets must
   // use sessionKey. This matches ihciah/miaomiaoji-tool registerCrcKeyToBt().
   const encoded = (Number(sessionKey) ^ CRC_SEED) >>> 0;
   return packP1Frame(P1.SET_CRC_KEY, u32le(encoded), 0, CRC_SEED);
+}
+
+/**
+ * Reassemble Protocol 02 notifications.  BLE notification boundaries are
+ * transport boundaries, not Paperang frame boundaries: one notification may
+ * contain half a frame or several frames.  The parser accepts a list of CRC
+ * seeds during a transition so a caller can inspect a response while moving
+ * from the standard key to a negotiated key.
+ */
+export class P1StreamParser {
+  constructor(crcSeeds = [CRC_SEED]) {
+    this.buffer = new Uint8Array();
+    this.setCrcSeeds(crcSeeds);
+  }
+
+  setCrcSeeds(crcSeeds = [CRC_SEED]) {
+    const seeds = Array.isArray(crcSeeds) ? crcSeeds : [crcSeeds];
+    this.crcSeeds = [...new Set(seeds.map((seed) => Number(seed) >>> 0))];
+    if (!this.crcSeeds.length) this.crcSeeds = [CRC_SEED];
+    return this;
+  }
+
+  reset() { this.buffer = new Uint8Array(); }
+
+  push(chunk) {
+    const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+    this.buffer = concatBytes(this.buffer, data);
+    const frames = [];
+
+    while (this.buffer.length >= 2) {
+      let start = -1;
+      for (let i = 0; i < this.buffer.length; i += 1) {
+        if (this.buffer[i] === P1.HEAD) { start = i; break; }
+      }
+      if (start < 0) {
+        this.buffer = this.buffer[this.buffer.length - 1] === P1.HEAD ? this.buffer.slice(-1) : new Uint8Array();
+        break;
+      }
+      if (start > 0) this.buffer = this.buffer.slice(start);
+      if (this.buffer.length < 5) break;
+
+      const payloadLength = this.buffer[3] | (this.buffer[4] << 8);
+      const total = 10 + payloadLength;
+      if (total < 10 || total > 65545) {
+        this.buffer = this.buffer.slice(1);
+        continue;
+      }
+      if (this.buffer.length < total) break;
+
+      const candidate = this.buffer.slice(0, total);
+      const parsedBySeed = this.crcSeeds.map((seed) => parseP1Frame(candidate, seed)).filter(Boolean);
+      if (!parsedBySeed.length) {
+        this.buffer = this.buffer.slice(1);
+        continue;
+      }
+      const verified = parsedBySeed.find((parsed) => parsed.crcOk);
+      frames.push(verified || parsedBySeed[0]);
+      this.buffer = this.buffer.slice(total);
+    }
+
+    if (this.buffer.length === 1 && this.buffer[0] !== P1.HEAD) this.buffer = new Uint8Array();
+    return frames;
+  }
 }
 
 export const A5 = Object.freeze({

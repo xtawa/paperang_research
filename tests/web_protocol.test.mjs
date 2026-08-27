@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   A5, CRC_SEED, P1, P1_SESSION_CRC_KEY, a5PrintChunkSize, buildA5PrintDataPayload, crc32, hex,
-  A5StreamParser, buildHandshakeNoParamsRequest, buildHandshakeRequest, buildSystemRequest, parseA5Payload, parseTlvArgs,
-  packA5Frame, packP1Frame, parseA5Frame, p1RegistrationFrame,
+  A5StreamParser, P1StreamParser, buildHandshakeNoParamsRequest, buildHandshakeRequest, buildSystemRequest,
+  parseA5Payload, parseP1Frame, parseTlvArgs, packA5Frame, packP1Frame, parseA5Frame, p1RegistrationFrame,
 } from '../web/src/protocol.js';
 import { packBinaryPixels, thresholdPixels } from '../web/src/raster.js';
 
@@ -18,6 +18,44 @@ test('P1 frame encodes command/index/LE length/payload/CRC/tail', () => {
   const frame = packP1Frame(P1.SET_DENSITY, Uint8Array.from([75]), 3, P1_SESSION_CRC_KEY);
   assert.equal(frame[0], 0x02); assert.equal(frame[1], 0x19); assert.equal(frame[2], 3);
   assert.equal(frame[3], 1); assert.equal(frame[4], 0); assert.equal(frame.at(-1), 0x03);
+});
+
+test('P1 direct WebBLE self-test vector uses the standard CRC seed', () => {
+  const frame = packP1Frame(P1.SELF_TEST, Uint8Array.from([0]), 0, CRC_SEED);
+  assert.equal(hex(frame), '021b0001000046895e9e03');
+  const parsed = parseP1Frame(frame, CRC_SEED);
+  assert.ok(parsed);
+  assert.equal(parsed.command, P1.SELF_TEST);
+  assert.equal(parsed.packetIndex, 0);
+  assert.deepEqual([...parsed.payload], [0]);
+  assert.equal(parsed.crcOk, true);
+});
+
+test('P1 stream parser reassembles fragmented and combined frames', () => {
+  const parser = new P1StreamParser([CRC_SEED, P1_SESSION_CRC_KEY]);
+  const one = packP1Frame(P1.GET_VERSION, Uint8Array.from([1]), 0, CRC_SEED);
+  const two = packP1Frame(P1.SET_DENSITY, Uint8Array.from([75]), 0, P1_SESSION_CRC_KEY);
+  assert.equal(parser.push(Uint8Array.from([0x99, 0x88, ...one.slice(0, 4)])).length, 0);
+  const frames = parser.push(Uint8Array.from([...one.slice(4), ...two]));
+  assert.equal(frames.length, 2);
+  assert.equal(frames[0].command, P1.GET_VERSION);
+  assert.equal(frames[0].crcSeed, CRC_SEED);
+  assert.equal(frames[0].crcOk, true);
+  assert.equal(frames[1].command, P1.SET_DENSITY);
+  assert.equal(frames[1].crcSeed, P1_SESSION_CRC_KEY);
+  assert.equal(frames[1].crcOk, true);
+});
+
+test('P1 stream parser reports a bad CRC and resynchronizes at the next frame', () => {
+  const parser = new P1StreamParser(CRC_SEED);
+  const bad = packP1Frame(P1.GET_VERSION, Uint8Array.from([1]), 0, CRC_SEED);
+  bad[bad.length - 2] ^= 0x01;
+  const good = packP1Frame(P1.GET_VERSION, Uint8Array.from([1]), 1, CRC_SEED);
+  const frames = parser.push(Uint8Array.from([0x00, ...bad, ...good]));
+  assert.equal(frames.length, 2);
+  assert.equal(frames[0].crcOk, false);
+  assert.equal(frames[1].crcOk, true);
+  assert.equal(frames[1].packetIndex, 1);
 });
 
 test('A5 known start frame and parser', () => {
