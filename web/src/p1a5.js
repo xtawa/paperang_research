@@ -1,4 +1,5 @@
 export const P1_A5_PRINT_END_PAYLOAD = new Uint8Array([0x05, 0x1a, 0x01, 0x00, 0x00]);
+export const P1_A5_SELF_TEST_PAYLOAD = new Uint8Array([0x05, 0x17, 0x01, 0x00, 0x00]);
 
 export function normalizedA5Model(instance) {
   return String(instance?.deviceInfo?.deviceType || '').replace(/[^\x20-\x7e]/g, '').trim().toUpperCase();
@@ -16,10 +17,11 @@ export function decodeA5ResponseEnvelope(result) {
   const code = args[0];
   const len = args[1] | (args[2] << 8);
   if (len !== args.length - 3) return { state: 'unknown', code, data: args.slice(3) };
-  // Real-device evidence: accepted read/set commands use envelope 01 <len>,
-  // while this P1's PrintStart/Data/End return 02 0000 and do not actuate.
+  // APK static constants confirm response envelope types:
+  // 01 = OK, 02 = ERROR, 03 = INVALID.
   if (code === 0x01) return { state: 'ok', code, data: args.slice(3) };
   if (code === 0x02) return { state: 'error', code, data: args.slice(3) };
+  if (code === 0x03) return { state: 'invalid', code, data: args.slice(3) };
   return { state: 'unknown', code, data: args.slice(3) };
 }
 
@@ -28,7 +30,10 @@ function assertA5Accepted(result, label) {
   if (status.state === 'ok') return status;
   const code = status.code == null ? '??' : `0x${status.code.toString(16).padStart(2, '0')}`;
   if (status.state === 'error') {
-    throw new Error(`${label} 被设备拒绝（response envelope ${code} / 02 0000）。System 已连接，但打印会话尚未获准；优先检查官方 Auth/onDevConnSuccess 状态。`);
+    throw new Error(`${label} 被设备拒绝（response envelope ${code} / ERROR）。System 已连接，但该操作尚未获准；优先检查官方 Auth/onDevConnSuccess 状态。`);
+  }
+  if (status.state === 'invalid') {
+    throw new Error(`${label} 被设备判定为 INVALID（response envelope ${code}）。`);
   }
   throw new Error(`${label} 返回未知 A5 响应（code=${code}）`);
 }
@@ -48,6 +53,7 @@ export function installP1A5Overrides(PaperangWebTransport, protocol) {
   const originalProbe = proto.probeCompatibilityThermal;
   const originalEnsure = proto.ensureProtocolReady;
   const originalPrintA5 = proto.printA5;
+  const originalSelfTest = proto.selfTest;
 
   proto.probeCompatibilityThermal = async function probeCompatibilityThermalP1Aware() {
     if (!isP1A5Device(this)) return originalProbe.call(this);
@@ -79,6 +85,7 @@ export function installP1A5Overrides(PaperangWebTransport, protocol) {
     this.protocolReady = this.compatReady;
     if (accepted) this.diag('compat', 'ok', 'P1+A5 05/19 PrintStart 返回 OK(01)；384px 打印会话可用');
     else if (startStatus.state === 'error') this.diag('compat', 'error', 'P1+A5 05/19 返回 ERROR(02 0000)：命令格式可识别，但设备拒绝开始打印；优先检查 Auth/onDevConnSuccess');
+    else if (startStatus.state === 'invalid') this.diag('compat', 'error', 'P1+A5 05/19 返回 INVALID(03)：当前 PrintStart 请求不适用于设备状态/协议');
     else if (start) this.diag('compat', 'error', `P1+A5 05/19 有响应但状态未知（code=${startStatus.code ?? 'n/a'}）`);
     else this.diag('compat', 'error', 'P1+A5 05/19 无 A5 响应；打印通道未就绪');
     return this.compatReady;
@@ -88,6 +95,26 @@ export function installP1A5Overrides(PaperangWebTransport, protocol) {
     if (!isP1A5Device(this)) return originalEnsure.call(this);
     if (this.compatReady) return true;
     return this.probeCompatibilityThermal();
+  };
+
+  // APK Protocol_A5 has data_thermal_child_self_test_page = 0x17 and selfTest()
+  // takes no arguments. Keep this diagnostic available whenever GATT is connected,
+  // even when PrintStart is auth-gated, so P1 FF00/A5 users can test the device
+  // without falsely marking the entire print pipeline ready.
+  proto.selfTest = async function selfTestP1A5Aware() {
+    if (!isP1A5Device(this)) return originalSelfTest.call(this);
+    if (!this.connected) throw new Error('打印机未连接');
+
+    this.emit('log', 'P1+A5：发送 05/17 SelfTestPage');
+    const response = await this.queryA5(P1_A5_SELF_TEST_PAYLOAD, {
+      domain: A5.DOMAIN_THERMAL,
+      command: 0x17,
+      timeout: this.isIOS ? 1500 : 1050,
+      required: true,
+    });
+    const status = assertA5Accepted(response, 'P1+A5 05/17 SelfTestPage');
+    this.emit('log', 'P1+A5：05/17 SelfTestPage 返回 OK(01)');
+    return status;
   };
 
   proto.printA5 = async function printA5P1Aware(raster, widthBytes, feedMm) {
