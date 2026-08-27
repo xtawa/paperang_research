@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   A5, CRC_SEED, P1, a5PrintChunkSize, buildA5PrintDataPayload, crc32, hex,
+  A5StreamParser, buildHandshakeRequest, buildSystemRequest, parseA5Payload, parseTlvArgs,
   packA5Frame, packP1Frame, parseA5Frame, p1RegistrationFrame,
 } from '../web/src/protocol.js';
 import { packBinaryPixels, thresholdPixels } from '../web/src/raster.js';
@@ -36,4 +37,34 @@ test('raster packs black=1 MSB first', () => {
   const bits = Uint8Array.from([1,0,1,0,0,0,0,1]);
   assert.deepEqual([...packBinaryPixels(bits, 8, 1)], [0xa1]);
   assert.deepEqual([...thresholdPixels(Uint8Array.from([0,255]), 128, false)], [1,0]);
+});
+
+test('APK-confirmed A5 System 01/17 handshake frame matches captured layout', () => {
+  const frame = packA5Frame(buildHandshakeRequest('P4sdFat2pBd0h4mh'));
+  assert.equal(hex(frame), 'a5011800011701130001100050347364466174327042643068346d687c3eb3c95a');
+  const parsed = parseA5Payload(parseA5Frame(frame));
+  assert.equal(parsed.domain, 0x01);
+  assert.equal(parsed.command, 0x17);
+  assert.equal(parsed.kind, 0x01);
+  assert.equal(parsed.tlv.values[0].tag, 0x01);
+  assert.equal(parsed.tlv.values[0].text, 'P4sdFat2pBd0h4mh');
+});
+
+test('A5 stream parser reassembles fragmented notifications and skips BLE noise', () => {
+  const parser = new A5StreamParser();
+  const one = packA5Frame(buildSystemRequest(A5.SYS_PROTOCOL_VERSION));
+  const two = packA5Frame(buildSystemRequest(A5.SYS_SN));
+  assert.equal(parser.push(Uint8Array.from([0x01, 0x04, ...one.slice(0, 5)])).length, 0);
+  const frames = parser.push(Uint8Array.from([...one.slice(5), ...two]));
+  assert.equal(frames.length, 2);
+  assert.equal(parseA5Payload(frames[0]).command, A5.SYS_PROTOCOL_VERSION);
+  assert.equal(parseA5Payload(frames[1]).command, A5.SYS_SN);
+});
+
+test('TLV parser handles multiple handshake response fields', () => {
+  const bytes = Uint8Array.from([1,2,0,65,66, 2,3,0,120,121,122]);
+  const parsed = parseTlvArgs(bytes);
+  assert.equal(parsed.complete, true);
+  assert.equal(parsed.values[0].text, 'AB');
+  assert.equal(parsed.values[1].text, 'xyz');
 });

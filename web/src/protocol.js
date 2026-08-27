@@ -11,7 +11,6 @@ const CRC_TABLE = (() => {
 })();
 
 export function crc32(bytes, seed = CRC_SEED) {
-  // Python zlib.crc32(data, seed) compatible.
   let crc = (seed ^ 0xffffffff) >>> 0;
   for (const b of bytes) crc = CRC_TABLE[(crc ^ b) & 0xff] ^ (crc >>> 8);
   return (crc ^ 0xffffffff) >>> 0;
@@ -40,43 +39,34 @@ export function hex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+export function utf8(text) { return new TextEncoder().encode(String(text)); }
+export function utf8Text(bytes) {
+  try { return new TextDecoder('utf-8', { fatal: false }).decode(bytes).replace(/\0+$/g, '').trim(); }
+  catch (_) { return ''; }
+}
+
 export const P1 = Object.freeze({
-  HEAD: 0x02,
-  TAIL: 0x03,
-  PRINT_DATA: 0x00,
-  GET_VERSION: 0x04,
-  GET_SN: 0x0a,
-  GET_BATTERY: 0x10,
-  SET_CRC_KEY: 0x18,
-  SET_DENSITY: 0x19,
-  FEED_LINE: 0x1a,
-  SELF_TEST: 0x1b,
-  DEFAULT_PARAMS: 0x22,
-  SET_PAPER_TYPE: 0x2c,
+  HEAD: 0x02, TAIL: 0x03, PRINT_DATA: 0x00, GET_VERSION: 0x04, GET_SN: 0x0a,
+  GET_BATTERY: 0x10, SET_CRC_KEY: 0x18, SET_DENSITY: 0x19, FEED_LINE: 0x1a,
+  SELF_TEST: 0x1b, DEFAULT_PARAMS: 0x22, SET_PAPER_TYPE: 0x2c,
 });
 
 export function packP1Frame(command, payload = new Uint8Array(), packetIndex = 0, seed = CRC_SEED) {
   const data = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
   if (data.length > 0xffff) throw new RangeError('P1 payload exceeds uint16 length');
-  return concatBytes(
-    new Uint8Array([P1.HEAD, command & 0xff, packetIndex & 0xff]),
-    u16le(data.length),
-    data,
-    u32le(crc32(data, seed)),
-    new Uint8Array([P1.TAIL]),
-  );
+  return concatBytes(new Uint8Array([P1.HEAD, command & 0xff, packetIndex & 0xff]), u16le(data.length), data,
+    u32le(crc32(data, seed)), new Uint8Array([P1.TAIL]));
 }
 
-export function p1RegistrationFrame() {
-  // APK/public-prior-art compatible fixed CRC key registration.
-  return packP1Frame(P1.SET_CRC_KEY, u32le(CRC_SEED), 0, CRC_SEED);
-}
+export function p1RegistrationFrame() { return packP1Frame(P1.SET_CRC_KEY, u32le(CRC_SEED), 0, CRC_SEED); }
 
 export const A5 = Object.freeze({
-  PREFIX: new Uint8Array([0xa5, 0x01]),
-  SUFFIX: 0x5a,
-  MAX_FRAME_SIZE: 237,
-  PRINT_DATA_OVERHEAD: 26,
+  PREFIX: new Uint8Array([0xa5, 0x01]), SUFFIX: 0x5a, MAX_FRAME_SIZE: 237, PRINT_DATA_OVERHEAD: 26,
+  TYPE_REQUEST: 0x01, TYPE_RESPONSE: 0x02, TYPE_BROADCAST: 0x03,
+  DOMAIN_SYSTEM: 0x01, DOMAIN_THERMAL: 0x05,
+  SYS_DEVICE_INFO: 0x01, SYS_SN: 0x02, SYS_SW_VERSION: 0x07, SYS_PRODUCT_MODEL: 0x08,
+  SYS_BATTERY: 0x0b, SYS_MAX_LEN: 0x14, SYS_PROTOCOL_VERSION: 0x15, SYS_SHAKE_HAND: 0x17,
+  SYS_SET_DEVICE_KEY: 0x18, SYS_SHAKE_NOTICE: 0x1f, SYS_MAX_CACHE: 0x20,
   STATUS_PAYLOAD: new Uint8Array([0x05, 0x0f, 0x01, 0x00, 0x00, 0x00]),
   START_RASTER_PAYLOAD: new Uint8Array([0x05, 0x19, 0x01, 0x00, 0x00]),
   FINISH_RASTER_PAYLOAD: new Uint8Array([0x05, 0x22, 0x01, 0x02, 0x00, 0x00, 0x00]),
@@ -88,22 +78,50 @@ export function packA5Frame(payload) {
   return concatBytes(A5.PREFIX, u16le(data.length), data, u32le(crc32(data)), new Uint8Array([A5.SUFFIX]));
 }
 
-export function buildA5Payload(domain, command, args = new Uint8Array(), kind = 0x01) {
+export function buildA5Payload(domain, command, args = new Uint8Array(), kind = A5.TYPE_REQUEST) {
   const data = args instanceof Uint8Array ? args : new Uint8Array(args);
   return concatBytes(new Uint8Array([domain & 0xff, command & 0xff, kind & 0xff]), u16le(data.length), data);
 }
 
+export function buildTlv(tag, value) {
+  const data = typeof value === 'string' ? utf8(value) : (value instanceof Uint8Array ? value : new Uint8Array(value));
+  return concatBytes(new Uint8Array([tag & 0xff]), u16le(data.length), data);
+}
+
+export function parseTlvArgs(args) {
+  const data = args instanceof Uint8Array ? args : new Uint8Array(args);
+  const values = [];
+  let off = 0;
+  while (off + 3 <= data.length) {
+    const tag = data[off];
+    const len = data[off + 1] | (data[off + 2] << 8);
+    off += 3;
+    if (off + len > data.length) return { values, complete: false, trailing: data.slice(off - 3) };
+    const bytes = data.slice(off, off + len);
+    values.push({ tag, bytes, text: utf8Text(bytes) });
+    off += len;
+  }
+  return { values, complete: off === data.length, trailing: data.slice(off) };
+}
+
+export function buildSystemRequest(command, args = new Uint8Array()) {
+  return buildA5Payload(A5.DOMAIN_SYSTEM, command, args, A5.TYPE_REQUEST);
+}
+
+export function buildHandshakeRequest(challenge) {
+  const encoded = utf8(challenge);
+  if (encoded.length !== 16) throw new RangeError('Paperang A5 handshake challenge must be exactly 16 UTF-8 bytes');
+  return buildSystemRequest(A5.SYS_SHAKE_HAND, buildTlv(0x01, encoded));
+}
+
+export function buildHandshakeNoParamsRequest() { return buildSystemRequest(A5.SYS_SHAKE_HAND); }
+
 export function buildA5PrintDataPayload(data, chunkNumber, widthBytes, final = false) {
   const chunk = data instanceof Uint8Array ? data : new Uint8Array(data);
   if (chunk.length % widthBytes !== 0) throw new RangeError('A5 print chunk must contain whole raster rows');
-  const args = concatBytes(
-    u16le(chunkNumber),
-    u16le(chunk.length + 8),
-    new Uint8Array([0x01, widthBytes & 0xff, 0, 0, 0, 0]),
-    u16le(chunk.length),
-    chunk,
-  );
-  return buildA5Payload(0x05, 0x1b, args, final ? 0x03 : 0x01);
+  const args = concatBytes(u16le(chunkNumber), u16le(chunk.length + 8),
+    new Uint8Array([0x01, widthBytes & 0xff, 0, 0, 0, 0]), u16le(chunk.length), chunk);
+  return buildA5Payload(A5.DOMAIN_THERMAL, 0x1b, args, final ? 0x03 : 0x01);
 }
 
 export function a5PrintChunkSize(widthBytes) {
@@ -121,5 +139,54 @@ export function parseA5Frame(packet) {
   const off = 4 + len;
   const got = (p[off] | (p[off + 1] << 8) | (p[off + 2] << 16) | (p[off + 3] << 24)) >>> 0;
   const expected = crc32(payload);
-  return got === expected ? { payload, crc: got } : null;
+  return got === expected ? { raw: p, payload, crc: got } : null;
+}
+
+export function parseA5Payload(payloadOrFrame) {
+  const payload = payloadOrFrame?.payload instanceof Uint8Array ? payloadOrFrame.payload
+    : (payloadOrFrame instanceof Uint8Array ? payloadOrFrame : new Uint8Array(payloadOrFrame || []));
+  if (payload.length < 5) return null;
+  const argsLen = payload[3] | (payload[4] << 8);
+  if (payload.length !== 5 + argsLen) return null;
+  const args = payload.slice(5);
+  return { domain: payload[0], command: payload[1], kind: payload[2], args, tlv: parseTlvArgs(args) };
+}
+
+// BLE notifications are not packet boundaries. The Android APK's ProtocolParser keeps
+// temporary bytes for exactly this reason. This reassembler accepts fragmented/combined
+// notification data and emits validated A5 frames while discarding unrelated BLE status bytes.
+export class A5StreamParser {
+  constructor() { this.buffer = new Uint8Array(); }
+  reset() { this.buffer = new Uint8Array(); }
+  push(chunk) {
+    const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+    this.buffer = concatBytes(this.buffer, data);
+    const frames = [];
+    while (this.buffer.length >= 2) {
+      let start = -1;
+      for (let i = 0; i + 1 < this.buffer.length; i += 1) {
+        if (this.buffer[i] === 0xa5 && this.buffer[i + 1] === 0x01) { start = i; break; }
+      }
+      if (start < 0) {
+        this.buffer = this.buffer.slice(Math.max(0, this.buffer.length - 1));
+        break;
+      }
+      if (start > 0) this.buffer = this.buffer.slice(start);
+      if (this.buffer.length < 4) break;
+      const len = this.buffer[2] | (this.buffer[3] << 8);
+      const total = 2 + 2 + len + 4 + 1;
+      if (total > 65544) { this.buffer = this.buffer.slice(2); continue; }
+      if (this.buffer.length < total) break;
+      const candidate = this.buffer.slice(0, total);
+      const parsed = parseA5Frame(candidate);
+      if (parsed) {
+        frames.push(parsed);
+        this.buffer = this.buffer.slice(total);
+      } else {
+        // Bad CRC/tail: resync at the next possible prefix instead of poisoning the stream.
+        this.buffer = this.buffer.slice(2);
+      }
+    }
+    return frames;
+  }
 }
