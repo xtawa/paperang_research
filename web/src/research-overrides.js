@@ -4,6 +4,8 @@ function normalizeUuid(value) {
   return String(value || '').toLowerCase();
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function syncMobileSelfTest(transport = window.__paperangTransport) {
   if (!mobileSelfTestButton) return;
   const legacyP1 = Boolean(transport?.connected && transport?.profile === 'p1');
@@ -41,13 +43,16 @@ export function installResearchOverrides(PaperangWebTransport, UUIDS, protocol) 
   const originalDetectProfile = proto.detectProfile;
   const originalRequestAndConnect = proto.requestAndConnect;
   const originalDisconnect = proto.disconnect;
+  const originalSetDensity = proto.setDensity;
+  const originalFeed = proto.feed;
+  const originalPrintP1 = proto.printP1;
 
-  // Existing public Paperang P1 work (ihciah/python-paperang/Yrr0r paperang-web)
-  // uses the 49535343 BLE service with Protocol 02 and does not require the newer
-  // FF00/A5 auth lifecycle. Our previous detector always tried FF00 first, which
-  // could hide a simultaneously exposed legacy P1 service. For devices advertising
-  // themselves explicitly as Paperang_P1, prefer that proven path and fall back to
-  // FF00/A5 only when the legacy service is genuinely absent.
+  const p1Frame = (command, payload = new Uint8Array(), packetIndex = 0) =>
+    protocol.packP1Frame(command, payload, packetIndex, protocol.P1_SESSION_CRC_KEY);
+
+  // Existing public Paperang P1 work (ihciah/miaomiaoji-tool/Yrr0r paperang-web)
+  // uses the 49535343 BLE service with Protocol 02. Prefer that proven path on a
+  // device explicitly named Paperang_P1 and only fall back to FF00/A5 if absent.
   proto.detectProfile = async function detectProfileResearchAware() {
     const name = String(this.device?.name || '');
     if (/^Paperang[_ -]?P1$/i.test(name)) {
@@ -62,15 +67,53 @@ export function installResearchOverrides(PaperangWebTransport, UUIDS, protocol) 
     return originalDetectProfile.call(this);
   };
 
-  // Do not present an unvalidated A5 command as a self-test. Public FF00/A5
-  // implementations still mark built-in self-test as unmapped. Keep the known
-  // command 27 only for the legacy P1 Protocol 02 profile.
+  // Once SET_CRC_KEY is sent, all later Protocol-02 packets must use the negotiated
+  // session key. The previous browser implementation accidentally registered a new
+  // key and then kept CRC'ing commands with the standard seed, so the printer could
+  // silently discard self-test and raster packets.
+  proto.setDensity = async function setDensityResearchAware(value) {
+    if (this.profile !== 'p1') return originalSetDensity.call(this, value);
+    const density = Math.max(0, Math.min(100, Number(value) | 0));
+    await this.writeFrame(p1Frame(protocol.P1.SET_DENSITY, new Uint8Array([density])), { preferResponse: this.isIOS });
+    await sleep(this.isIOS ? 80 : 20);
+  };
+
   proto.selfTest = async function selfTestResearchAware() {
     if (this.profile !== 'p1') {
       throw new Error('当前设备走 FF00/A5；内置自检命令尚无可靠公开映射。若设备同时提供 49535343，重新连接后会自动优先使用老 P1 协议。');
     }
     if (!this.connected) throw new Error('打印机未连接');
-    await this.writeFrame(protocol.packP1Frame(protocol.P1.SELF_TEST, new Uint8Array([0])), { preferResponse: this.isIOS });
+    const frame = p1Frame(protocol.P1.SELF_TEST, new Uint8Array([0]));
+    this.emit('log', `P1 Protocol 02：发送自检 command 27，session CRC key=0x${protocol.P1_SESSION_CRC_KEY.toString(16).padStart(8, '0')}`);
+    await this.writeFrame(frame, { preferResponse: this.isIOS });
+    await sleep(this.isIOS ? 180 : 80);
+  };
+
+  proto.feed = async function feedResearchAware(mm, widthBytes = null) {
+    if (this.profile !== 'p1') return originalFeed.call(this, mm, widthBytes);
+    const amount = Math.max(0, Math.min(100, Number(mm) || 0));
+    await this.writeFrame(p1Frame(protocol.P1.FEED_LINE, protocol.u16le(Math.round(amount * 56))), { preferResponse: this.isIOS });
+  };
+
+  proto.printP1 = async function printP1ResearchAware(raster, widthBytes, feedMm) {
+    if (this.profile !== 'p1') return originalPrintP1.call(this, raster, widthBytes, feedMm);
+    if (widthBytes !== 48) throw new Error('P1 当前实现要求 384px / 48 bytes 每行');
+
+    await this.writeFrame(p1Frame(protocol.P1.DEFAULT_PARAMS, new Uint8Array([0])), { preferResponse: this.isIOS });
+    await sleep(this.isIOS ? 100 : 40);
+    await this.writeFrame(p1Frame(protocol.P1.SET_PAPER_TYPE, new Uint8Array([0])), { preferResponse: this.isIOS });
+    await sleep(this.isIOS ? 80 : 20);
+
+    const size = (this.isIOS ? 3 : 10) * widthBytes;
+    let packetIndex = 0;
+    for (let offset = 0; offset < raster.length; offset += size) {
+      const chunk = raster.slice(offset, offset + size);
+      await this.writeFrame(p1Frame(protocol.P1.PRINT_DATA, chunk, packetIndex), { preferResponse: this.isIOS });
+      packetIndex = (packetIndex + 1) & 0xff;
+      this.emit('progress', { sent: Math.min(offset + chunk.length, raster.length), total: raster.length });
+      await sleep(this.isIOS ? 18 : 8);
+    }
+    if (feedMm > 0) await this.feed(feedMm, widthBytes);
   };
 
   proto.requestAndConnect = async function requestAndConnectResearchAware() {
@@ -80,6 +123,9 @@ export function installResearchOverrides(PaperangWebTransport, UUIDS, protocol) 
       this.addEventListener('disconnected', () => syncMobileSelfTest(this));
     }
     const result = await originalRequestAndConnect.call(this);
+    if (result.profile === 'p1') {
+      this.emit('log', `P1 CRC session 已初始化：0x${protocol.P1_SESSION_CRC_KEY.toString(16).padStart(8, '0')}；后续 Protocol 02 命令使用 session CRC`);
+    }
     syncMobileSelfTest(this);
     return result;
   };
@@ -114,6 +160,7 @@ export function installMobileSelfTestButton() {
       button.innerHTML = '<span class="dock-icon">✓</span><span>已发送自检</span>';
       setTimeout(() => syncMobileSelfTest(transport), 1200);
     } catch (error) {
+      transport.emit?.('log', `自检失败：${error.message || error}`);
       button.innerHTML = '<span class="dock-icon">!</span><span>自检失败</span>';
       button.title = error.message || String(error);
       setTimeout(() => syncMobileSelfTest(transport), 1800);
