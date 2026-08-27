@@ -222,6 +222,71 @@ async function print() {
   } finally { ui.print.disabled = !transport.ready || !raster; if (ui.mobilePrint) ui.mobilePrint.disabled = !transport.ready || !raster; }
 }
 
+function showDiagnosticText(text) {
+  document.getElementById('paperangDiagOverlay')?.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'paperangDiagOverlay';
+  Object.assign(overlay.style, { position: 'fixed', inset: '0', zIndex: '9999', background: 'rgba(0,0,0,.72)', padding: 'max(16px, env(safe-area-inset-top)) 14px max(16px, env(safe-area-inset-bottom))', display: 'flex', alignItems: 'center', justifyContent: 'center' });
+  const card = document.createElement('div');
+  Object.assign(card.style, { width: 'min(760px,100%)', maxHeight: '88vh', display: 'grid', gridTemplateRows: 'auto minmax(0,1fr) auto', gap: '10px', background: 'var(--panel)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '16px', padding: '14px' });
+  const title = document.createElement('strong'); title.textContent = '诊断 JSON · 可长按全选复制';
+  const ta = document.createElement('textarea'); ta.value = text; ta.readOnly = true;
+  Object.assign(ta.style, { width: '100%', minHeight: '52vh', resize: 'none', border: '1px solid var(--border)', borderRadius: '10px', background: 'var(--code)', color: '#d7dae0', padding: '10px', font: '11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace' });
+  const actions = document.createElement('div'); Object.assign(actions.style, { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' });
+  const copy = document.createElement('button'); copy.className = 'btn primary'; copy.type = 'button'; copy.textContent = '复制 JSON';
+  const close = document.createElement('button'); close.className = 'btn'; close.type = 'button'; close.textContent = '关闭';
+  copy.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(text); copy.textContent = '✓ 已复制'; log('诊断 JSON 已复制到剪贴板');
+    } catch (_) {
+      ta.focus(); ta.select();
+      try { document.execCommand('copy'); copy.textContent = '✓ 已复制'; log('诊断 JSON 已通过兼容方式复制'); }
+      catch (_) { copy.textContent = '请长按文本复制'; }
+    }
+  });
+  close.addEventListener('click', () => overlay.remove());
+  actions.append(copy, close); card.append(title, ta, actions); overlay.append(card); document.body.append(overlay);
+  setTimeout(() => { ta.focus(); ta.setSelectionRange(0, 0); }, 0);
+}
+
+async function exportDiagnostic() {
+  const report = transport.getDiagnosticReport();
+  const text = JSON.stringify(report, null, 2);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const fileName = `paperang-diagnostic-${stamp}.json`;
+  let copied = false;
+  try {
+    if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); copied = true; }
+  } catch (_) {}
+
+  try {
+    if (typeof File !== 'undefined' && navigator.share && navigator.canShare) {
+      const file = new File([text], fileName, { type: 'application/json' });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'Paperang diagnostic JSON' });
+        log(`已通过系统分享导出诊断 JSON${copied ? '，同时已复制到剪贴板' : ''}`);
+        return;
+      }
+    }
+  } catch (e) {
+    if (e?.name !== 'AbortError') log(`系统分享不可用：${e.message || e}`);
+  }
+
+  if (!transport.isIOS) {
+    try {
+      const blob = new Blob([text], { type: 'application/json' });
+      const url = URL.createObjectURL(blob); const a = document.createElement('a');
+      a.href = url; a.download = fileName; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      log(`已触发诊断 JSON 下载${copied ? '，同时已复制到剪贴板' : ''}`);
+      return;
+    } catch (_) {}
+  }
+
+  showDiagnosticText(text);
+  log(copied ? 'Bluefy/iOS 下载受限：JSON 已复制到剪贴板，并已打开可复制文本' : 'Bluefy/iOS 下载受限：已打开完整 JSON，可长按全选复制');
+}
+
 transport.addEventListener('progress', (e) => { ui.progress.value = e.detail.total ? e.detail.sent / e.detail.total : 0; });
 transport.addEventListener('notification', (e) => log(`RX ${e.detail.uuid}`, e.detail.bytes));
 transport.addEventListener('log', (e) => log(e.detail));
@@ -261,17 +326,7 @@ ui.rerunDiag?.addEventListener('click', async () => {
   finally { ui.rerunDiag.disabled = !transport.connected || transport.profile !== 'p2-a5'; }
 });
 
-ui.exportDiag?.addEventListener('click', () => {
-  try {
-    const report = transport.getDiagnosticReport();
-    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob); const a = document.createElement('a');
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    a.href = url; a.download = `paperang-diagnostic-${stamp}.json`; a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    log('已导出连接诊断 JSON（不包含 Paperang 账号 Token/App Secret；设备回包可能包含设备 SN）');
-  } catch (e) { log(`导出诊断失败：${e.message}`); }
-});
+ui.exportDiag?.addEventListener('click', () => { exportDiagnostic().catch((e) => log(`导出诊断失败：${e.message || e}`)); });
 ui.clearLog.addEventListener('click', () => { ui.log.textContent = ''; });
 ui.exportRaster.addEventListener('click', () => {
   if (!raster) return;
