@@ -114,8 +114,8 @@ function render() {
     }
     ctx.putImageData(out, 0, 0);
     ui.meta.textContent = `${ui.file.files?.[0]?.name || '图片'} · 输出 ${width}×${outputHeight}px · raster ${(raster.length / 1024).toFixed(1)} KB`;
-    ui.print.disabled = !transport.connected;
-    if (ui.mobilePrint) ui.mobilePrint.disabled = !transport.connected;
+    ui.print.disabled = !transport.ready;
+    if (ui.mobilePrint) ui.mobilePrint.disabled = !transport.ready;
     ui.exportRaster.disabled = false;
   } catch (error) {
     setStatus(error.message, 'error'); log(`渲染失败：${error.message}`);
@@ -129,18 +129,28 @@ async function connect() {
     setStatus('正在选择并连接设备…');
     transport.gattChunk = Number(ui.gattChunk.value);
     const result = await transport.requestAndConnect();
-    ui.disconnect.disabled = false; ui.feed.disabled = false;
+    ui.disconnect.disabled = false;
+    ui.feed.disabled = !result.ready;
     if (ui.mobileConnect) {
       ui.mobileConnect.disabled = false;
-      ui.mobileConnect.innerHTML = '<span class="dock-icon">✓</span><span>已连接</span>';
+      ui.mobileConnect.innerHTML = result.ready
+        ? '<span class="dock-icon">✓</span><span>已就绪</span>'
+        : '<span class="dock-icon">!</span><span>仅 GATT</span>';
     }
-    ui.selfTest.disabled = result.profile !== 'p1';
+    ui.selfTest.disabled = result.profile !== 'p1' || !result.ready;
     ui.profile.disabled = true;
-    setStatus(`已连接 ${result.name}`, 'ok');
-    log(`连接成功：${result.name} · ${result.profile}`);
+    if (result.ready) {
+      setStatus(`已连接 ${result.name}`, 'ok');
+      log(`连接成功：${result.name} · ${result.profile} · protocol ready`);
+    } else {
+      setStatus('GATT 已连接，但打印协议未就绪', 'error');
+      log(`GATT 已连接：${result.name} · ${result.profile}，但未收到协议握手响应`);
+    }
     updateProfileUi();
-    await transport.setDensity(ui.density.value);
-    log(`已设置打印浓度 ${ui.density.value}`);
+    if (result.ready) {
+      await transport.setDensity(ui.density.value);
+      log(`已设置打印浓度 ${ui.density.value}`);
+    }
   } catch (error) {
     if (ui.mobileConnect) ui.mobileConnect.disabled = false;
     setStatus(`连接失败：${error.message}`, 'error'); log(`连接失败：${error.stack || error.message}`);
@@ -161,7 +171,7 @@ async function print() {
   } catch (error) {
     setStatus(`打印失败：${error.message}`, 'error'); log(`打印失败：${error.stack || error.message}`);
   } finally {
-    const disabled = !transport.connected || !raster;
+    const disabled = !transport.ready || !raster;
     ui.print.disabled = disabled;
     if (ui.mobilePrint) ui.mobilePrint.disabled = disabled;
   }
