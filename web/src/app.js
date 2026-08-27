@@ -41,11 +41,35 @@ function resetDiagnostics() {
   if (ui.rerunDiag) ui.rerunDiag.disabled = true;
   if (ui.exportDiag) ui.exportDiag.disabled = true;
 }
+
+function modelName() {
+  return String(transport.deviceInfo?.deviceType || '').replace(/[^\x20-\x7e]/g, '').trim();
+}
+
+function modelRasterWidth() {
+  const model = modelName().toUpperCase();
+  if (/^P1(?:\b|$)/.test(model)) return 384;
+  if (/^P2(?:\b|$)/.test(model)) return 576;
+  return null;
+}
+
+function formatDeviceValue(key, value) {
+  if (key === 'battery' && Number.isFinite(Number(value))) {
+    const raw = Number(value);
+    const percent = raw > 100 ? raw / 10 : raw;
+    return `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%`;
+  }
+  if (key === 'maxLen' && Number.isFinite(Number(value))) return `${Number(value)} B`;
+  return value;
+}
+
 function renderDeviceInfo(info = {}, authState = '') {
   if (!ui.deviceInfoPanel) return;
   const lines = [];
   const labels = { softwareVersion: 'SW', deviceType: 'Type', sn: 'SN', battery: 'Battery', protocolVersion: 'Protocol', maxLen: 'MaxLen', maxCache: 'MaxCache' };
-  for (const [key, label] of Object.entries(labels)) if (info[key] !== undefined && info[key] !== null && String(info[key]) !== '') lines.push(`${label}: ${info[key]}`);
+  for (const [key, label] of Object.entries(labels)) {
+    if (info[key] !== undefined && info[key] !== null && String(info[key]) !== '') lines.push(`${label}: ${formatDeviceValue(key, info[key])}`);
+  }
   if (authState) lines.push(`Auth: ${authState}`);
   lines.push(`Official ready: ${transport.officialReady ? 'yes' : 'no'}`);
   lines.push(`Compat ready: ${transport.compatReady ? 'yes' : 'no'}`);
@@ -66,8 +90,10 @@ function updateDiagnostic(detail) {
 }
 
 function selectedWidth() {
-  if (transport.profile === 'p2-a5') return 576;
+  const actual = modelRasterWidth();
+  if (actual) return actual;
   if (transport.profile === 'p1') return 384;
+  if (transport.profile === 'p2-a5') return 576;
   return Number(ui.profile.value) === 576 ? 576 : 384;
 }
 
@@ -76,8 +102,9 @@ function updateProfileUi() {
   outputWidth = w;
   ui.width.textContent = `${w}px (${w / 8} bytes/row)`;
   if (ui.paperWidthLabel) ui.paperWidthLabel.textContent = `${w} DOTS`;
+  const model = modelName();
   if (transport.profile === 'p1') ui.profileHint.textContent = '已探测：P1 / Protocol 02 / 49535343';
-  else if (transport.profile === 'p2-a5') ui.profileHint.textContent = '已探测：P2 / FF00 / A5';
+  else if (transport.profile === 'p2-a5') ui.profileHint.textContent = model ? `已探测：${model} · FF00 / A5 · ${w}px` : `已探测：FF00 / A5 · ${w}px`;
   else ui.profileHint.textContent = w === 384 ? '预览：P1 384px' : '预览：P2 576px';
   render();
 }
@@ -228,6 +255,7 @@ ui.rerunDiag?.addEventListener('click', async () => {
     if (ui.mobileConnect) ui.mobileConnect.innerHTML = result.compatReady
       ? '<span class="dock-icon">✓</span><span>兼容就绪</span>'
       : '<span class="dock-icon">!</span><span>仅 GATT</span>';
+    updateProfileUi();
     setStatus(result.compatReady ? '兼容 A5 打印通道已就绪 · 官方状态见诊断' : '诊断完成 · 打印通道仍未就绪', result.compatReady ? 'ok' : 'error');
   } catch (e) { setStatus(`诊断失败：${e.message}`, 'error'); log(`诊断失败：${e.stack || e.message}`); }
   finally { ui.rerunDiag.disabled = !transport.connected || transport.profile !== 'p2-a5'; }
