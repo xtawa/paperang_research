@@ -10,6 +10,7 @@ const ui = {
   brightness: $('brightness'), brightnessValue: $('brightnessValue'), dither: $('dither'), invert: $('invert'), rotate: $('rotate'), scale: $('scale'), scaleValue: $('scaleValue'),
   density: $('density'), densityValue: $('densityValue'), feedMm: $('feedMm'), gattChunk: $('gattChunk'), log: $('log'),
   meta: $('imageMeta'), progress: $('progress'), clearLog: $('clearLog'), exportRaster: $('exportRaster'),
+  mobileConnect: $('mobileConnectProxy'), mobilePrint: $('mobilePrintProxy'), paperWidthLabel: $('paperWidthLabel'),
 };
 
 const transport = new PaperangWebTransport();
@@ -39,6 +40,7 @@ function updateProfileUi() {
   const w = selectedWidth();
   outputWidth = w;
   ui.width.textContent = `${w}px (${w / 8} bytes/row)`;
+  if (ui.paperWidthLabel) ui.paperWidthLabel.textContent = `${w} DOTS`;
   if (transport.profile === 'p1') ui.profileHint.textContent = '已探测：P1 / Protocol 02 / 49535343';
   else if (transport.profile === 'p2-a5') ui.profileHint.textContent = '已探测：P2 / FF00 / A5';
   else ui.profileHint.textContent = w === 384 ? '预览：P1 384px' : '预览：P2 576px';
@@ -85,7 +87,13 @@ function drawSource(width) {
 }
 
 function render() {
-  if (!imageBitmap) { raster = null; ui.print.disabled = true; ui.exportRaster.disabled = true; return; }
+  if (!imageBitmap) {
+    raster = null;
+    ui.print.disabled = true;
+    if (ui.mobilePrint) ui.mobilePrint.disabled = true;
+    ui.exportRaster.disabled = true;
+    return;
+  }
   try {
     const width = selectedWidth();
     const imageData = drawSource(width);
@@ -107,6 +115,7 @@ function render() {
     ctx.putImageData(out, 0, 0);
     ui.meta.textContent = `${ui.file.files?.[0]?.name || '图片'} · 输出 ${width}×${outputHeight}px · raster ${(raster.length / 1024).toFixed(1)} KB`;
     ui.print.disabled = !transport.connected;
+    if (ui.mobilePrint) ui.mobilePrint.disabled = !transport.connected;
     ui.exportRaster.disabled = false;
   } catch (error) {
     setStatus(error.message, 'error'); log(`渲染失败：${error.message}`);
@@ -115,10 +124,16 @@ function render() {
 
 async function connect() {
   try {
-    ui.connect.disabled = true; setStatus('正在选择并连接设备…');
+    ui.connect.disabled = true;
+    if (ui.mobileConnect) ui.mobileConnect.disabled = true;
+    setStatus('正在选择并连接设备…');
     transport.gattChunk = Number(ui.gattChunk.value);
     const result = await transport.requestAndConnect();
     ui.disconnect.disabled = false; ui.feed.disabled = false;
+    if (ui.mobileConnect) {
+      ui.mobileConnect.disabled = false;
+      ui.mobileConnect.innerHTML = '<span class="dock-icon">✓</span><span>已连接</span>';
+    }
     ui.selfTest.disabled = result.profile !== 'p1';
     ui.profile.disabled = true;
     setStatus(`已连接 ${result.name}`, 'ok');
@@ -127,6 +142,7 @@ async function connect() {
     await transport.setDensity(ui.density.value);
     log(`已设置打印浓度 ${ui.density.value}`);
   } catch (error) {
+    if (ui.mobileConnect) ui.mobileConnect.disabled = false;
     setStatus(`连接失败：${error.message}`, 'error'); log(`连接失败：${error.stack || error.message}`);
   } finally { ui.connect.disabled = transport.connected; }
 }
@@ -134,7 +150,9 @@ async function connect() {
 async function print() {
   if (!raster) return;
   try {
-    ui.print.disabled = true; ui.progress.value = 0;
+    ui.print.disabled = true;
+    if (ui.mobilePrint) ui.mobilePrint.disabled = true;
+    ui.progress.value = 0;
     transport.gattChunk = Number(ui.gattChunk.value);
     await transport.setDensity(ui.density.value);
     log(`开始打印 ${outputWidth}×${outputHeight}px, ${raster.length} bytes`);
@@ -142,7 +160,11 @@ async function print() {
     ui.progress.value = 1; setStatus('打印数据发送完成', 'ok'); log('打印数据发送完成');
   } catch (error) {
     setStatus(`打印失败：${error.message}`, 'error'); log(`打印失败：${error.stack || error.message}`);
-  } finally { ui.print.disabled = !transport.connected || !raster; }
+  } finally {
+    const disabled = !transport.connected || !raster;
+    ui.print.disabled = disabled;
+    if (ui.mobilePrint) ui.mobilePrint.disabled = disabled;
+  }
 }
 
 transport.addEventListener('progress', (e) => { ui.progress.value = e.detail.total ? e.detail.sent / e.detail.total : 0; });
@@ -150,6 +172,11 @@ transport.addEventListener('notification', (e) => log(`RX ${e.detail.uuid}`, e.d
 transport.addEventListener('log', (e) => log(e.detail));
 transport.addEventListener('disconnected', () => {
   ui.connect.disabled = false; ui.disconnect.disabled = true; ui.print.disabled = true; ui.feed.disabled = true; ui.selfTest.disabled = true; ui.profile.disabled = false;
+  if (ui.mobilePrint) ui.mobilePrint.disabled = true;
+  if (ui.mobileConnect) {
+    ui.mobileConnect.disabled = false;
+    ui.mobileConnect.innerHTML = '<span class="dock-icon">⌁</span><span>连接</span>';
+  }
   setStatus('未连接'); updateProfileUi();
 });
 
@@ -157,9 +184,11 @@ ui.file.addEventListener('change', () => loadFile(ui.file.files[0]).catch((e) =>
 ui.connect.addEventListener('click', connect);
 ui.disconnect.addEventListener('click', () => transport.disconnect());
 ui.print.addEventListener('click', print);
+ui.mobileConnect?.addEventListener('click', () => transport.connected ? transport.disconnect() : connect());
+ui.mobilePrint?.addEventListener('click', print);
 ui.feed.addEventListener('click', async () => { try { await transport.feed(ui.feedMm.value, outputWidth / 8); log(`走纸 ${ui.feedMm.value} mm`); } catch (e) { log(`走纸失败：${e.message}`); } });
 ui.selfTest.addEventListener('click', async () => { try { await transport.selfTest(); log('已发送 P1 自检命令'); } catch (e) { log(`自检失败：${e.message}`); } });
-ui.clearLog.addEventListener('click', () => { ui.log.textContent = ''; });
+ui.clearLog.addEventListener('click', (event) => { event.preventDefault(); ui.log.textContent = ''; });
 ui.exportRaster.addEventListener('click', () => {
   if (!raster) return;
   const blob = new Blob([raster], { type: 'application/octet-stream' });
@@ -177,6 +206,7 @@ ui.gattChunk.addEventListener('change', () => { transport.gattChunk = Number(ui.
 if (!navigator.bluetooth) {
   setStatus('此浏览器不支持 Web Bluetooth', 'error');
   ui.connect.disabled = true;
+  if (ui.mobileConnect) ui.mobileConnect.disabled = true;
   log('Web Bluetooth 不可用。请使用桌面 Chrome/Edge 或 Android Chrome/Samsung Internet。');
 } else setStatus('未连接');
 updateProfileUi();
