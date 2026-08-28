@@ -52,11 +52,16 @@ On a device exposing the P1 service, the web client:
    characteristics;
 2. subscribes to the known notify characteristic and any additional notify or
    indicate characteristics;
-3. probes each write candidate with `GET_VERSION` payload `01`, standard CRC;
-4. selects the first candidate with a CRC-verified response;
-5. reads SN and battery using the public query payload `01` convention;
-6. sends P1 raster frames intact when they fit the 512-byte whole-write limit;
-7. logs every P1 TX/RX frame, CRC seed, UUID, write method, and preservation
+3. probes known candidates with `GET_VERSION` payload `01`, standard CRC, and
+   explicit ATT methods in this order: without response, with response, then
+   legacy `writeValue`;
+4. selects the first UUID/method pair with a CRC-verified response;
+5. if no response arrives, retains the first successful known write pair rather
+   than the last fallback characteristic and marks the path unverified;
+6. reads SN and battery using the public query payload `01` convention when a
+   response was verified;
+7. sends P1 raster frames intact when they fit the 512-byte whole-write limit;
+8. logs every P1 TX/RX frame, CRC seed, UUID, write method, and preservation
    state.
 
 If a candidate accepts writes but does not return notifications, the UI marks
@@ -74,12 +79,14 @@ Use a fresh paper roll and keep the device visible. In the browser:
 5. check whether a short solid black strip appears and whether the TX log has:
    - `0x22` default parameters;
    - `0x2c` paper type;
-   - `0x00` print data with `payloadLength = 384`;
+   - `0x00` print data totaling 384 bytes; on iOS the expected frame payloads
+     are 144, 144, and 96 bytes (3/3/2 rows), while desktop sends one 384-byte
+     payload for this 8-row test;
    - `framePreserved = true`;
    - `0x1a` feed;
 6. if there is no output, disconnect and compare `writeCharacteristic`,
-   `writeMethod`, `crcSeed`, `p1History`, and `p1.txHistory` before changing
-   protocol constants.
+   `preferredWriteMethod`, `p1.probe.attempts`, `crcSeed`, `p1History`, and
+   `p1.txHistory` before changing protocol constants.
 
 The next discriminating experiment is to call the explicit session path only
 after saving a clean direct-path report. If session registration is required by

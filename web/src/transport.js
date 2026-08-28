@@ -38,6 +38,7 @@ function scalarFromA5(parsed) {
 }
 
 const P1_WRITE_ORDER = Object.freeze(['P1_WRITE_6DAA', 'P1_WRITE_8841']);
+const P1_WRITE_METHOD_ORDER = Object.freeze(['writeValueWithoutResponse', 'writeValueWithResponse', 'writeValue']);
 const P1_PROTOCOL_FRAME_LIMIT = 512;
 
 function normalizeUuid(value) { return String(value || '').toLowerCase(); }
@@ -60,6 +61,24 @@ function characteristicInfo(characteristic) {
   };
 }
 
+function p1ProbeMethods(characteristic) {
+  const info = characteristicInfo(characteristic);
+  const properties = characteristicProperties(characteristic);
+  const uuid = normalizeUuid(characteristic?.uuid);
+  const knownP1Write = [UUIDS.P1_WRITE_6DAA, UUIDS.P1_WRITE_8841].includes(uuid);
+  return P1_WRITE_METHOD_ORDER.filter((method) => {
+    if (!info.methods[method]) return false;
+    // Bluefy may expose all three methods even when its properties object is
+    // incomplete. The two known P1 write UUIDs are therefore probed explicitly
+    // in both ATT modes. For non-standard fallback characteristics, trust the
+    // reported property before attempting the method.
+    if (knownP1Write) return true;
+    if (method === 'writeValueWithoutResponse') return properties.writeWithoutResponse;
+    if (method === 'writeValueWithResponse') return properties.write;
+    return true;
+  });
+}
+
 function p1Text(payload) {
   const text = utf8Text(payload);
   return text && [...text].every((char) => {
@@ -75,7 +94,7 @@ export class PaperangWebTransport extends EventTarget {
     this.gattChunk = 237; this.sessionConnected = false; this.protocolReady = false; this.compatReady = false; this.officialReady = false; this.isIOS = isIOSLike();
     this.a5Parser = new A5StreamParser(); this.a5Waiters = new Set();
     this.p1Parser = new P1StreamParser([CRC_SEED, P1_SESSION_CRC_KEY]); this.p1Waiters = new Set();
-    this.p1WriteCandidates = []; this.p1Characteristics = []; this.p1CrcMode = 'standard-direct';
+    this.p1WriteCandidates = []; this.p1Characteristics = []; this.p1Probe = null; this.p1WriteMethod = null; this.p1CrcMode = 'standard-direct';
     this.p1CrcSeed = CRC_SEED; this.p1SessionCrcKey = P1_SESSION_CRC_KEY; this.p1RegistrationSent = false;
     this.deviceInfo = {}; this.handshake = null;
     this.authState = 'unknown'; this.diagnostics = {}; this.rxHistory = []; this.a5History = []; this.p1History = []; this.p1TxHistory = []; this.lastDiagnosticReport = null;
@@ -101,7 +120,7 @@ export class PaperangWebTransport extends EventTarget {
         notifyCharacteristics: this.notifyChars.map((c) => c.uuid) },
       authState: this.authState, deviceInfo: { ...this.deviceInfo }, handshake: this.handshake ? JSON.parse(JSON.stringify(this.handshake)) : null,
       p1: { crcMode: this.p1CrcMode, crcSeed: this.p1CrcSeed, sessionCrcKey: this.p1SessionCrcKey,
-        registrationSent: this.p1RegistrationSent, probe: this.p1Probe || null, characteristics: this.p1Characteristics,
+        registrationSent: this.p1RegistrationSent, preferredWriteMethod: this.p1WriteMethod || null, probe: this.p1Probe || null, characteristics: this.p1Characteristics,
         writeCandidates: this.p1WriteCandidates.map((c) => characteristicInfo(c)), parserBufferLength: this.p1Parser.buffer.length,
         history: this.p1History.slice(-120), txHistory: this.p1TxHistory.slice(-120) },
       diagnostics: JSON.parse(JSON.stringify(this.diagnostics)), rxHistory: this.rxHistory.slice(-120), a5History: this.a5History.slice(-80),
@@ -217,18 +236,33 @@ export class PaperangWebTransport extends EventTarget {
   }
 
   waitForP1(predicate, timeout = 1000) {
-    return new Promise((resolve) => {
-      const waiter = { predicate, resolve, timer: null };
-      waiter.timer = setTimeout(() => { this.p1Waiters.delete(waiter); resolve(null); }, timeout);
+    let cancel = () => {};
+    const promise = new Promise((resolve) => {
+      const waiter = { predicate, resolve: null, timer: null };
+      const finish = (value) => { clearTimeout(waiter.timer); this.p1Waiters.delete(waiter); resolve(value); };
+      waiter.resolve = finish;
+      cancel = () => finish(null);
+      waiter.timer = setTimeout(() => finish(null), timeout);
       this.p1Waiters.add(waiter);
     });
+    promise.cancel = cancel;
+    return promise;
   }
 
-  async queryP1(command, payload = new Uint8Array(), { responseCommands = [command, (command + 1) & 0xff], timeout = 1000, label = '' } = {}) {
+  async queryP1(command, payload = new Uint8Array(), {
+    responseCommands = [command, (command + 1) & 0xff], timeout = 1000, label = '', writeMethod = '', allowFallback = true,
+  } = {}) {
     if (!this.connected) throw new Error('打印机未连接');
     const expected = new Set(responseCommands);
     const wait = this.waitForP1(({ frame }) => expected.has(frame.command) && frame.crcOk, timeout);
-    await this.writeFrame(packP1Frame(command, payload, 0, this.p1CrcSeed), { preferResponse: this.isIOS });
+    try {
+      await this.writeFrame(packP1Frame(command, payload, 0, this.p1CrcSeed), {
+        preferResponse: this.isIOS, methodOverride: writeMethod, allowFallback,
+      });
+    } catch (error) {
+      wait.cancel?.();
+      throw error;
+    }
     const response = await wait;
     if (!response && label) this.emit('log', `P1 ${label} 无已验证回包（等待 ${timeout}ms）`);
     return response;
@@ -237,43 +271,68 @@ export class PaperangWebTransport extends EventTarget {
   async initializeP1Connection() {
     this.protocolReady = false; this.compatReady = false; this.officialReady = false;
     this.authState = 'legacy-not-required'; this.deviceInfo = {};
-    this.p1CrcMode = 'standard-direct'; this.p1CrcSeed = CRC_SEED; this.p1RegistrationSent = false;
+    this.p1CrcMode = 'standard-direct'; this.p1CrcSeed = CRC_SEED; this.p1RegistrationSent = false; this.p1WriteMethod = null;
     this.p1Parser.reset(); this.p1Parser.setCrcSeeds([CRC_SEED]);
     this.diag('handshake', 'running', 'Protocol 02 WebBLE：标准 CRC 直连探测（不发送 SET_CRC_KEY）');
 
     const candidates = this.p1WriteCandidates.length ? this.p1WriteCandidates : (this.writeChar ? [this.writeChar] : []);
     let selected = null;
     let writeOnlyCandidate = null;
+    let writeOnlyMethod = null;
+    const attempts = [];
+    const probeTimeout = this.isIOS ? 900 : 650;
+    this.p1Probe = { selected: null, method: null, responseVerified: false, writeOnly: false, attempts };
+
+    // Candidate order is meaningful: 6DAA is the public direct-WebBLE path,
+    // 8841 is the known alternate, and other writable characteristics are only
+    // fallbacks. Probe the ATT write method explicitly so a successful JS
+    // Promise cannot hide a write-mode mismatch.
+    probeLoop:
     for (const candidate of candidates) {
-      this.writeChar = candidate;
-      this.p1Parser.reset();
       const info = characteristicInfo(candidate);
-      this.emit('log', `P1 GET_VERSION probe：char=${info.uuid} properties=${JSON.stringify(info.properties)} payload=01 crcSeed=0x${CRC_SEED.toString(16).padStart(8, '0')}`);
-      try {
-        const response = await this.queryP1(P1.GET_VERSION, Uint8Array.from([1]), {
-          responseCommands: [P1.GET_VERSION, (P1.GET_VERSION + 1) & 0xff],
-          timeout: this.isIOS ? 1200 : 850,
-          label: 'GET_VERSION',
-        });
-        writeOnlyCandidate = candidate;
-        if (!response) continue;
-        selected = candidate;
-        this.p1CrcMode = 'standard-direct'; this.p1CrcSeed = response.frame.crcSeed;
-        this.p1Parser.setCrcSeeds([this.p1CrcSeed]);
-        const version = p1Text(response.frame.payload);
-        if (version) this.deviceInfo.softwareVersion = version;
-        this.emit('log', `P1 GET_VERSION 已验证：char=${info.uuid} payload=${hex(response.frame.payload)}${version ? ` text=${version}` : ''}`);
-        break;
-      } catch (error) {
-        this.emit('log', `P1 GET_VERSION probe 写入失败：char=${info.uuid} error=${error.message || error}`);
+      const methods = p1ProbeMethods(candidate);
+      if (!methods.length) {
+        attempts.push({ uuid: info.uuid, method: null, properties: info.properties, writeOk: false, responseVerified: false, error: '没有可用的写入方法' });
+        continue;
+      }
+      for (const method of methods) {
+        this.writeChar = candidate;
+        this.p1Parser.reset();
+        const attempt = { uuid: info.uuid, method, properties: info.properties, writeOk: false, responseVerified: false };
+        attempts.push(attempt);
+        this.emit('log', `P1 GET_VERSION probe：char=${info.uuid} method=${method} properties=${JSON.stringify(info.properties)} payload=01 crcSeed=0x${CRC_SEED.toString(16).padStart(8, '0')}`);
+        try {
+          const response = await this.queryP1(P1.GET_VERSION, Uint8Array.from([1]), {
+            responseCommands: [P1.GET_VERSION, (P1.GET_VERSION + 1) & 0xff],
+            timeout: probeTimeout,
+            label: 'GET_VERSION',
+            writeMethod: method,
+            allowFallback: false,
+          });
+          attempt.writeOk = true;
+          if (!writeOnlyCandidate) { writeOnlyCandidate = candidate; writeOnlyMethod = method; }
+          if (!response) continue;
+          attempt.responseVerified = true;
+          selected = candidate;
+          this.p1WriteMethod = method;
+          this.p1CrcMode = 'standard-direct'; this.p1CrcSeed = response.frame.crcSeed;
+          this.p1Parser.setCrcSeeds([this.p1CrcSeed]);
+          const version = p1Text(response.frame.payload);
+          if (version) this.deviceInfo.softwareVersion = version;
+          this.emit('log', `P1 GET_VERSION 已验证：char=${info.uuid} method=${method} payload=${hex(response.frame.payload)}${version ? ` text=${version}` : ''}`);
+          break probeLoop;
+        } catch (error) {
+          attempt.error = error.message || String(error);
+          this.emit('log', `P1 GET_VERSION probe 写入失败：char=${info.uuid} method=${method} error=${attempt.error}`);
+        }
       }
     }
 
     if (selected) {
       this.writeChar = selected;
-      this.p1Probe = { selected: selected.uuid, responseVerified: true, writeOnly: false };
+      this.p1Probe = { selected: selected.uuid, method: this.p1WriteMethod, responseVerified: true, writeOnly: false, attempts };
       this.protocolReady = true; this.compatReady = true;
-      this.diag('handshake', 'ok', `Protocol 02 标准 CRC 已验证；write=${selected.uuid}`);
+      this.diag('handshake', 'ok', `Protocol 02 标准 CRC 已验证；write=${selected.uuid}；method=${this.p1WriteMethod}`);
       this.diag('compat', 'ok', 'P1 GET_VERSION 收到 CRC 校验通过的 Protocol 02 回包');
       await this.queryP1Metadata();
       this.diag('ready', 'ok', 'P1 兼容打印就绪（标准 CRC 直连）');
@@ -282,17 +341,18 @@ export class PaperangWebTransport extends EventTarget {
 
     if (writeOnlyCandidate) {
       this.writeChar = writeOnlyCandidate;
+      this.p1WriteMethod = writeOnlyMethod;
       this.p1CrcMode = 'standard-direct-unverified'; this.p1CrcSeed = CRC_SEED;
       this.p1Parser.setCrcSeeds([CRC_SEED]);
-      this.p1Probe = { selected: writeOnlyCandidate.uuid, responseVerified: false, writeOnly: true };
+      this.p1Probe = { selected: writeOnlyCandidate.uuid, method: writeOnlyMethod, responseVerified: false, writeOnly: true, attempts };
       this.protocolReady = true; this.compatReady = false;
-      this.diag('handshake', 'warn', `Protocol 02 写入成功但无已验证回包；write=${writeOnlyCandidate.uuid}`);
-      this.diag('compat', 'warn', 'P1 WebBLE 可写，但 GET_VERSION 未收到回包；自检/8 行黑条仍会记录完整 TX/RX');
+      this.diag('handshake', 'warn', `Protocol 02 写入成功但无已验证回包；write=${writeOnlyCandidate.uuid}；method=${writeOnlyMethod}`);
+      this.diag('compat', 'warn', `P1 WebBLE 可写但 GET_VERSION 未收到回包；已保留首个成功候选 ${writeOnlyCandidate.uuid} / ${writeOnlyMethod}；自检/8 行黑条仍会记录完整 TX/RX`);
       this.diag('ready', 'warn', 'P1 已进入未验证打印状态；物理输出仍需真机确认');
       return;
     }
 
-    this.p1Probe = { selected: null, responseVerified: false, writeOnly: false };
+    this.p1Probe = { selected: null, method: null, responseVerified: false, writeOnly: false, attempts };
     this.diag('handshake', 'error', '所有 P1 写特征值探测均失败');
     this.diag('compat', 'error', 'P1 service 存在，但没有成功写入 GET_VERSION');
     this.diag('ready', 'error', 'GATT 已连接，但 Protocol 02 未就绪');
@@ -520,7 +580,7 @@ export class PaperangWebTransport extends EventTarget {
     this.a5Waiters.clear(); this.a5Parser.reset(); this.server = null; this.profile = null; this.writeChar = null; this.notifyChars = [];
     for (const w of this.p1Waiters) { clearTimeout(w.timer); w.resolve(null); }
     this.p1Waiters.clear(); this.p1Parser.reset(); this.p1WriteCandidates = []; this.p1Characteristics = [];
-    this.p1CrcMode = 'standard-direct'; this.p1CrcSeed = CRC_SEED; this.p1RegistrationSent = false; this.p1Probe = null; this.lastWriteMethod = null;
+    this.p1CrcMode = 'standard-direct'; this.p1CrcSeed = CRC_SEED; this.p1RegistrationSent = false; this.p1Probe = null; this.p1WriteMethod = null; this.lastWriteMethod = null;
     this.sessionConnected = false; this.protocolReady = false; this.compatReady = false; this.officialReady = false; this.deviceInfo = {}; this.handshake = null; this.authState = 'unknown';
     if (!preserveDiagnostic) { this.diagnostics = {}; this.rxHistory = []; this.a5History = []; this.p1History = []; this.p1TxHistory = []; this.lastDiagnosticReport = null; }
     if (clearDevice) this.device = null;
@@ -548,22 +608,28 @@ export class PaperangWebTransport extends EventTarget {
     return method;
   }
 
-  async writeFrame(frame, { preserveFrame = false, preferResponse = false } = {}) {
+  async writeFrame(frame, { preserveFrame = false, preferResponse = false, methodOverride = '', allowFallback = true } = {}) {
     const configured = Math.max(20, Math.min(512, Number(this.gattChunk) || 237));
     const isP1 = this.profile === 'p1';
+    const selectedMethod = methodOverride || (isP1 ? this.p1WriteMethod || '' : '');
     const wholeFrameLimit = isP1 ? P1_PROTOCOL_FRAME_LIMIT : 237;
     const shouldPreserve = isP1 || this.profile === 'p2-a5' || preserveFrame;
     if (shouldPreserve && frame.length <= wholeFrameLimit) {
       try {
-        const method = await this.writeChunk(frame, { preferResponse });
+        const method = await this.writeChunk(frame, { preferResponse, methodOverride: selectedMethod });
         if (isP1) this.recordP1Tx(frame, { method, writes: 1, preserved: true });
         return;
-      } catch (error) { this.emit('log', `${isP1 ? 'P1' : '单帧'}写入失败，尝试保守分片：${error.message}`); }
+      } catch (error) {
+        if (!allowFallback) throw error;
+        this.emit('log', `${isP1 ? 'P1' : '单帧'}写入失败，尝试保守分片：${error.message}`);
+      }
     }
     const size = this.isIOS ? Math.min(configured, 180) : configured;
     const methods = [];
     for (let i = 0; i < frame.length; i += size) {
-      methods.push(await this.writeChunk(frame.slice(i, i + size), { preferResponse: this.isIOS || preferResponse }));
+      methods.push(await this.writeChunk(frame.slice(i, i + size), {
+        preferResponse: this.isIOS || preferResponse, methodOverride: selectedMethod,
+      }));
       if (frame.length > size) await sleep(this.isIOS ? 10 : 4);
     }
     if (isP1) this.recordP1Tx(frame, { method: [...new Set(methods)].join(','), writes: methods.length, preserved: false });

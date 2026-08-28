@@ -95,6 +95,14 @@ test('P1 initialization probes standard CRC without automatic registration', asy
   assert.equal(transport.p1CrcMode, 'standard-direct');
   assert.equal(transport.p1RegistrationSent, false);
   assert.deepEqual(transport.deviceInfo, { softwareVersion: 'P1-test-1.0', sn: 'SN-TEST', battery: 87 });
+  assert.equal(write.writes[0].method, 'writeValueWithoutResponse');
+  assert.equal(transport.p1Probe.method, 'writeValueWithoutResponse');
+  assert.deepEqual(transport.p1Probe.attempts.map(({ uuid, method, writeOk, responseVerified }) => ({ uuid, method, writeOk, responseVerified })), [{
+    uuid: UUIDS.P1_WRITE_6DAA,
+    method: 'writeValueWithoutResponse',
+    writeOk: true,
+    responseVerified: true,
+  }]);
 
   const requests = write.writes.map(({ bytes }) => parseP1Frame(bytes, CRC_SEED)).filter(Boolean);
   assert.deepEqual(requests.map((frame) => frame.command), [P1.GET_VERSION, P1.GET_SN, P1.GET_BATTERY]);
@@ -149,4 +157,78 @@ test('P1 explicit session registration is opt-in and changes subsequent CRC stat
   assert.equal(transport.p1CrcMode, 'session-registered-unverified');
   assert.equal(transport.p1CrcSeed, 0x06b8ef59);
   assert.equal(transport.p1Parser.crcSeeds[0], 0x06b8ef59);
+});
+
+test('P1 probe falls back from write-without-response to write-with-response on the same UUID', async () => {
+  let notify;
+  const payloads = new Map([
+    [P1.GET_VERSION, new TextEncoder().encode('P1-method-fallback')],
+    [P1.GET_SN, new TextEncoder().encode('SN-FALLBACK')],
+    [P1.GET_BATTERY, Uint8Array.from([64])],
+  ]);
+  const respond = async (_characteristic, method, bytes) => {
+    if (method === 'writeValueWithoutResponse') throw new Error('simulated unsupported ATT write mode');
+    if (method !== 'writeValueWithResponse') return;
+    const request = parseP1Frame(bytes, CRC_SEED);
+    const payload = request && payloads.get(request.command);
+    if (!request || !payload) return;
+    notify.notify(packP1Frame(request.command, payload, request.packetIndex, CRC_SEED));
+  };
+  const write = new FakeCharacteristic(UUIDS.P1_WRITE_6DAA, { write: true, writeWithoutResponse: true }, respond);
+  notify = new FakeCharacteristic(UUIDS.P1_NOTIFY, { notify: true });
+  const transport = new PaperangWebTransport();
+  transport.isIOS = false;
+  transport.profile = 'p1';
+  transport.sessionConnected = true;
+  transport.writeChar = write;
+  transport.p1WriteCandidates = [write];
+  notify.addEventListener('characteristicvaluechanged', (event) => {
+    const value = event.target.value;
+    transport.handleNotification(notify.uuid, new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+  });
+
+  await transport.initializeP1Connection();
+
+  assert.deepEqual(write.writes.slice(0, 2).map(({ method }) => method), ['writeValueWithoutResponse', 'writeValueWithResponse']);
+  assert.equal(transport.p1Probe.selected, UUIDS.P1_WRITE_6DAA);
+  assert.equal(transport.p1Probe.method, 'writeValueWithResponse');
+  assert.equal(transport.p1Probe.attempts[0].writeOk, false);
+  assert.match(transport.p1Probe.attempts[0].error, /simulated unsupported ATT write mode/);
+  assert.equal(transport.p1Probe.attempts[0].responseVerified, false);
+  assert.equal(transport.p1Probe.attempts[1].responseVerified, true);
+  assert.equal(transport.p1WriteMethod, 'writeValueWithResponse');
+  assert.deepEqual(transport.deviceInfo, { softwareVersion: 'P1-method-fallback', sn: 'SN-FALLBACK', battery: 64 });
+});
+
+test('P1 unverified probe keeps the first successful known candidate instead of the last fallback', async () => {
+  const write = new FakeCharacteristic(UUIDS.P1_WRITE_6DAA, { write: true, writeWithoutResponse: true });
+  const alternate = new FakeCharacteristic(UUIDS.P1_WRITE_8841, { write: true, writeWithoutResponse: true });
+  const fallback = new FakeCharacteristic('49535343-ACA3-481C-91EC-D85E28A60318', { write: true, notify: true });
+  const transport = new PaperangWebTransport();
+  transport.profile = 'p1';
+  transport.sessionConnected = true;
+  transport.writeChar = write;
+  transport.p1WriteCandidates = [write, alternate, fallback];
+  const calls = [];
+  transport.queryP1 = async (_command, _payload, options) => {
+    calls.push({ uuid: transport.writeChar.uuid, method: options.writeMethod });
+    return null;
+  };
+
+  await transport.initializeP1Connection();
+
+  assert.equal(transport.p1Probe.responseVerified, false);
+  assert.equal(transport.p1Probe.writeOnly, true);
+  assert.equal(transport.p1Probe.selected, UUIDS.P1_WRITE_6DAA);
+  assert.equal(transport.p1Probe.method, 'writeValueWithoutResponse');
+  assert.equal(transport.p1WriteMethod, 'writeValueWithoutResponse');
+  assert.deepEqual(calls.slice(0, 3).map(({ uuid, method }) => ({ uuid, method })), [
+    { uuid: UUIDS.P1_WRITE_6DAA, method: 'writeValueWithoutResponse' },
+    { uuid: UUIDS.P1_WRITE_6DAA, method: 'writeValueWithResponse' },
+    { uuid: UUIDS.P1_WRITE_6DAA, method: 'writeValue' },
+  ]);
+  assert.equal(calls.at(-1).uuid, fallback.uuid);
+
+  await transport.writeFrame(packP1Frame(P1.SELF_TEST, Uint8Array.from([0]), 0, CRC_SEED));
+  assert.equal(write.writes.at(-1).method, 'writeValueWithoutResponse');
 });

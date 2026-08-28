@@ -18,11 +18,14 @@ The repository root `index.html` is a dependency-free Web Bluetooth printer UI. 
 - desktop path sends 10 full rows / 480 payload bytes as one complete 490-byte Protocol 02 frame; iOS/WebBLE mode uses smaller 3-row frames and slower writes
 
 The default browser path is direct WebBLE: it probes `GET_VERSION` with payload
-`01`, using the standard seed, and does not send `SET_CRC_KEY`. This keeps the
-browser behavior aligned with the public WebBLE reference rather than the
-classic-SPP/session-key implementations. P1 response notifications are parsed
-as a stream, so a response may be fragmented across notifications or contain
-multiple frames.
+`01`, using the standard seed, and does not send `SET_CRC_KEY`. For each known
+P1 write characteristic, the probe explicitly tries
+`writeValueWithoutResponse`, `writeValueWithResponse`, then legacy
+`writeValue`; `6DAA` is tried before `8841`, and unverified fallback
+characteristics are tried last. This keeps the browser behavior aligned with
+the public WebBLE reference while exposing ATT write-mode differences in the
+diagnostic report. P1 response notifications are parsed as a stream, so a
+response may be fragmented across notifications or contain multiple frames.
 
 The session registration path is explicit and diagnostic-only. Calling
 `registerP1SessionCrc()` writes the public session-key vector:
@@ -124,8 +127,8 @@ For a connected `Paperang_P1`, the diagnostics panel exposes:
 1. `GET_VERSION`, `GET_SN`, and `GET_BATTERY` probes with verified CRC parsing;
 2. a `P1 8 行黑条` action that sends 8 rows × 48 bytes of `0xff` raster;
 3. an exportable report containing the selected write characteristic, reported
-   properties, write method, frame-preservation status, and recent full TX/RX
-   frames.
+   properties, ordered UUID/method probe attempts, selected write method,
+   frame-preservation status, and recent full TX/RX frames.
 
 If the printer produces no paper, export the report before disconnecting. The
 key fields are `p1.probe`, `connection.writeCharacteristic`,
