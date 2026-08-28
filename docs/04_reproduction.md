@@ -73,16 +73,18 @@ print(pack_frame(PRT_SET_HEAT_DENSITY, bytes([75])).hex())
 PY
 ```
 
-Example: feed 32 pixels/units with a two-byte payload used by several classic implementations:
+Example: feed with the one-byte payload used by the public P1 WebBLE reference:
 
 ```bash
 PYTHONPATH=tools python - <<'PY'
 from protocol02 import pack_frame, PRT_FEED_LINE
-print(pack_frame(PRT_FEED_LINE, (32).to_bytes(2, "little")).hex())
+print(pack_frame(PRT_FEED_LINE, bytes([210])).hex())
 PY
 ```
 
-Payload width can be model/firmware-specific. P1 WebBLE prior art sends a one-byte feed payload for its tested hardware; older Python implementations use `u16le`. Keep the transport capture/response when validating a specific model.
+Payload width can be model/firmware-specific. P1 WebBLE prior art sends a
+one-byte feed payload for its tested hardware; older Python implementations use
+`u16le`. Keep the transport capture/response when validating a specific model.
 
 ---
 

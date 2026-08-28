@@ -247,3 +247,25 @@ test('P1 unverified probe keeps the first successful known candidate instead of 
   await transport.writeFrame(packP1Frame(P1.SELF_TEST, Uint8Array.from([0]), 0, CRC_SEED));
   assert.equal(write.writes.at(-1).method, 'writeValueWithoutResponse');
 });
+
+test('P1 print path mirrors the public WebBLE minimal raster sequence', async () => {
+  const { transport, write } = makeP1Harness();
+  transport.isIOS = true;
+  transport.p1WriteMethod = 'writeValueWithoutResponse';
+  transport.p1TxHistory.length = 0;
+
+  await transport.printP1(new Uint8Array(8 * 48).fill(0xff), 48, 5);
+
+  const frames = write.writes.map(({ bytes }) => parseP1Frame(bytes, CRC_SEED)).filter(Boolean);
+  assert.deepEqual(frames.map((frame) => frame.command), [
+    P1.PRINT_DATA,
+    P1.PRINT_DATA,
+    P1.PRINT_DATA,
+    P1.FEED_LINE,
+  ]);
+  assert.deepEqual(frames.map((frame) => frame.packetIndex), [0, 1, 2, 0]);
+  assert.deepEqual(frames.map((frame) => frame.payloadLength), [144, 144, 96, 1]);
+  assert.equal(hex(frames.at(-1).payload), 'd2');
+  assert.equal(frames.some((frame) => frame.command === P1.DEFAULT_PARAMS || frame.command === P1.SET_PAPER_TYPE), false);
+  assert.ok(frames.every((frame) => frame.crcOk));
+});

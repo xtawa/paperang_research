@@ -1,7 +1,7 @@
 import {
   A5, A5StreamParser, CRC_SEED, P1, P1_SESSION_CRC_KEY, P1StreamParser, a5PrintChunkSize, buildA5PrintDataPayload,
   buildHandshakeNoParamsRequest, buildHandshakeRequest, buildSystemRequest,
-  hex, packA5Frame, packP1Frame, p1RegistrationFrame, parseA5Payload, parseP1ShortStatus, u16le, utf8Text,
+  hex, packA5Frame, packP1Frame, p1RegistrationFrame, parseA5Payload, parseP1ShortStatus, utf8Text,
 } from './protocol.js';
 
 export const UUIDS = Object.freeze({
@@ -40,6 +40,7 @@ function scalarFromA5(parsed) {
 const P1_WRITE_ORDER = Object.freeze(['P1_WRITE_6DAA', 'P1_WRITE_8841']);
 const P1_WRITE_METHOD_ORDER = Object.freeze(['writeValueWithoutResponse', 'writeValueWithResponse', 'writeValue']);
 const P1_PROTOCOL_FRAME_LIMIT = 512;
+const P1_FEED_UNITS_PER_MM = 42;
 
 function normalizeUuid(value) { return String(value || '').toLowerCase(); }
 
@@ -685,7 +686,16 @@ export class PaperangWebTransport extends EventTarget {
   async selfTest() { if (this.profile !== 'p1') throw new Error('P2 FF00/A5 自检命令尚未被可靠映射'); await this.writeFrame(packP1Frame(P1.SELF_TEST, new Uint8Array([0]), 0, this.p1CrcSeed), { preferResponse: this.isIOS }); }
   async feed(mm, widthBytes = null) {
     const a = Math.max(0, Math.min(100, Number(mm) || 0));
-    if (this.profile === 'p1') { await this.writeFrame(packP1Frame(P1.FEED_LINE, u16le(Math.round(a * 56)), 0, this.p1CrcSeed), { preferResponse: this.isIOS }); return; }
+    if (this.profile === 'p1') {
+      let units = Math.max(0, Math.round(a * P1_FEED_UNITS_PER_MM));
+      while (units > 0) {
+        const step = Math.min(255, units);
+        await this.writeFrame(packP1Frame(P1.FEED_LINE, new Uint8Array([step]), 0, this.p1CrcSeed), { preferResponse: this.isIOS });
+        units -= step;
+        if (units > 0) await sleep(this.isIOS ? 80 : 25);
+      }
+      return;
+    }
     if (this.profile === 'p2-a5') { const rows = Math.max(0, Math.round(a / 0.08472)); if (!rows) return; await this.printA5(new Uint8Array(rows * (widthBytes || 72)), widthBytes || 72, 0); return; }
     throw new Error('未知打印协议');
   }
@@ -699,8 +709,7 @@ export class PaperangWebTransport extends EventTarget {
     if (w !== 48) throw new Error('P1 当前实现要求 384px / 48 bytes 每行');
     if (!(r instanceof Uint8Array)) r = new Uint8Array(r);
     if (r.length % w !== 0) throw new RangeError('P1 raster length must contain whole rows');
-    await this.writeFrame(packP1Frame(P1.DEFAULT_PARAMS, new Uint8Array([0]), 0, this.p1CrcSeed), { preferResponse: this.isIOS }); await sleep(this.isIOS ? 100 : 40);
-    await this.writeFrame(packP1Frame(P1.SET_PAPER_TYPE, new Uint8Array([0]), 0, this.p1CrcSeed), { preferResponse: this.isIOS }); await sleep(this.isIOS ? 80 : 20);
+    this.emit('log', 'P1 打印采用公开 WebBLE 最小序列：PRINT_DATA → FEED_LINE(单字节)');
     const size = (this.isIOS ? 3 : 10) * w; let idx = 0;
     for (let o = 0; o < r.length; o += size) { const c = r.slice(o, o + size); await this.writeFrame(packP1Frame(P1.PRINT_DATA, c, idx, this.p1CrcSeed), { preferResponse: this.isIOS }); idx = (idx + 1) & 255; this.emit('progress', { sent: Math.min(o + c.length, r.length), total: r.length }); await sleep(this.isIOS ? 18 : 8); }
     if (f > 0) await this.feed(f, w);

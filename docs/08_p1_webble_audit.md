@@ -106,13 +106,12 @@ Use a fresh paper roll and keep the device visible. In the browser:
 3. export diagnostics once the probe completes;
 4. press `P1 8 行黑条`;
 5. check whether a short solid black strip appears and whether the TX log has:
-   - `0x22` default parameters;
-   - `0x2c` paper type;
    - `0x00` print data totaling 384 bytes; on iOS the expected frame payloads
      are 144, 144, and 96 bytes (3/3/2 rows), while desktop sends one 384-byte
      payload for this 8-row test;
    - `framePreserved = true`;
-   - `0x1a` feed;
+   - no default `0x22` or paper-type `0x2c` frames on the default path;
+   - `0x1a` feed with a one-byte payload, `d2` for the default 5 mm feed;
    - no repeated `P1 stream fragment ... (buffer 9B)` caused by
      `00 02 00 f7 01`; instead, expect `P1 RX short-status ...` and a
      non-empty `p1.shortStatusHistory`;

@@ -27,6 +27,12 @@ the public WebBLE reference while exposing ATT write-mode differences in the
 diagnostic report. P1 response notifications are parsed as a stream, so a
 response may be fragmented across notifications or contain multiple frames.
 
+The default P1 print job mirrors the public WebBLE reference as a conservative
+bring-up path: set density separately, send `0x00` raster chunks, then finish
+with `0x1a` using a one-byte feed payload. The browser no longer injects
+`0x22` default-parameter or `0x2c` paper-type frames into the default P1 path
+until those commands are physically confirmed for the connected firmware.
+
 The session registration path is explicit and diagnostic-only. Calling
 `registerP1SessionCrc()` writes the public session-key vector:
 
