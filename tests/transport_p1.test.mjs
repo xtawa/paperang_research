@@ -84,6 +84,21 @@ function makeP1Harness() {
   return { transport, write, alternate, notify };
 }
 
+test('P1 short status notification does not poison the Protocol 02 parser buffer', () => {
+  const { transport, notify } = makeP1Harness();
+  const logs = [];
+  transport.addEventListener('log', (event) => logs.push(event.detail));
+
+  transport.handleNotification(notify.uuid, Uint8Array.from([0x00, 0x02, 0x00, 0xf7, 0x01]));
+
+  assert.equal(transport.p1Parser.buffer.length, 0);
+  assert.equal(transport.p1History.length, 0);
+  assert.equal(transport.p1ShortStatusObserved, true);
+  assert.equal(transport.p1StatusHistory.length, 1);
+  assert.equal(transport.p1StatusHistory[0].returnId, 0x02);
+  assert.match(logs.at(-1), /short-status/);
+});
+
 test('P1 initialization probes standard CRC without automatic registration', async () => {
   const { transport, write } = makeP1Harness();
   const result = await transport.initializeP1Connection();

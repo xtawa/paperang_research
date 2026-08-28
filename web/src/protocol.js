@@ -102,6 +102,29 @@ export function parseP1Frame(packet, seed = CRC_SEED) {
   };
 }
 
+/**
+ * Parse the five-byte status-like notification observed from a Paperang P1
+ * on the ISSC notify characteristic. It is not a Protocol 02 frame: it has no
+ * 0x02 head, length field, CRC, or 0x03 tail. The field names mirror the
+ * status/return-id/parameter envelope documented for ISSC vendor responses;
+ * the P1-specific meaning of returnId=0x02 and code=0xf7 is intentionally
+ * left unresolved until a response corpus or physical confirmation exists.
+ */
+export function parseP1ShortStatus(packet) {
+  const p = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
+  if (p.length !== 5 || p[0] !== 0x00 || p[2] !== 0x00 || p[3] !== 0xf7 || p[4] !== 0x01) return null;
+  return {
+    raw: p,
+    kind: 'short-status',
+    status: p[0],
+    returnId: p[1],
+    parameters: p.slice(2),
+    code: p[3],
+    value: p[4],
+    pattern: '00 ?? 00 f7 01',
+  };
+}
+
 export function p1RegistrationFrame(sessionKey = P1_SESSION_CRC_KEY) {
   // The printer receives (sessionKey XOR standardKey), while this registration
   // packet itself is still CRC'd with the standard key. Subsequent packets must

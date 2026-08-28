@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   A5, CRC_SEED, P1, P1_SESSION_CRC_KEY, a5PrintChunkSize, buildA5PrintDataPayload, crc32, hex,
   A5StreamParser, P1StreamParser, buildHandshakeNoParamsRequest, buildHandshakeRequest, buildSystemRequest,
-  parseA5Payload, parseP1Frame, parseTlvArgs, packA5Frame, packP1Frame, parseA5Frame, p1RegistrationFrame,
+  parseA5Payload, parseP1Frame, parseP1ShortStatus, parseTlvArgs, packA5Frame, packP1Frame, parseA5Frame, p1RegistrationFrame,
 } from '../web/src/protocol.js';
 import { packBinaryPixels, thresholdPixels } from '../web/src/raster.js';
 
@@ -29,6 +29,17 @@ test('P1 direct WebBLE self-test vector uses the standard CRC seed', () => {
   assert.equal(parsed.packetIndex, 0);
   assert.deepEqual([...parsed.payload], [0]);
   assert.equal(parsed.crcOk, true);
+});
+
+test('P1 short status notification is kept separate from Protocol 02 frames', () => {
+  const parsed = parseP1ShortStatus(Uint8Array.from([0x00, 0x02, 0x00, 0xf7, 0x01]));
+  assert.ok(parsed);
+  assert.equal(parsed.kind, 'short-status');
+  assert.equal(parsed.status, 0x00);
+  assert.equal(parsed.returnId, 0x02);
+  assert.equal(hex(parsed.parameters), '00f701');
+  assert.equal(parseP1ShortStatus(Uint8Array.from([0x02, 0x00, 0x00, 0xf7, 0x01])), null);
+  assert.equal(parseP1ShortStatus(Uint8Array.from([0x00, 0x02, 0x00, 0xf7])), null);
 });
 
 test('P1 stream parser reassembles fragmented and combined frames', () => {

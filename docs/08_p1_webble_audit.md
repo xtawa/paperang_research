@@ -25,6 +25,33 @@ The standard CRC seed is `0x35769521`. The session vector used by the public
 SPP/Bleak implementations is `0x06b8ef59`; its registration payload is
 `0x06b8ef59 XOR 0x35769521 = 0x33ce7a78`, serialized as `78 7a ce 33`.
 
+## New P1 notification evidence
+
+The 2026-08-28 Bluefy capture shows that the printer is connected and accepts
+the direct WebBLE writes. After probes and print commands it emits repeated
+five-byte notifications on `...-1e4d-...`:
+
+```text
+00 00 00 f7 01
+00 02 00 f7 01
+```
+
+These records cannot be complete Protocol 02 frames: they do not have the
+`02` head, a Protocol 02 length/CRC layout, or the `03` tail. The browser now
+records the exact bytes as `p1.shortStatusHistory` and keeps them out of the
+Protocol 02 stream parser. The report retains `returnId`, the parameter bytes,
+and the observed `00 ?? 00 f7 01` pattern, but does not assign a P1-specific
+meaning to `0x02` or `0xf7` yet. This is evidence of a device-side response,
+not proof that the requested raster reached the thermal mechanism.
+
+The UUID roles are consistent with the [ISSC Bluetooth Controller application
+note](https://ww1.microchip.com/downloads/cn/AppNotes/cn574672.pdf): `1E4D` and
+`8841` are transparent data-path characteristics, while `6DAA` is an update/
+connection-parameter characteristic and `ACA3` is a vendor air-patch path.
+Because this P1's short records arrive on `1E4D`, the browser labels them
+conservatively as status-like notifications rather than pretending they are
+the documented `ACA3` response envelope.
+
 ## Failure modes found in the original browser path
 
 | item | observation | current status |
@@ -63,6 +90,8 @@ On a device exposing the P1 service, the web client:
 7. sends P1 raster frames intact when they fit the 512-byte whole-write limit;
 8. logs every P1 TX/RX frame, CRC seed, UUID, write method, and preservation
    state.
+9. records the observed five-byte status-like notifications separately from
+   Protocol 02 frames, including their UUID and raw bytes.
 
 If a candidate accepts writes but does not return notifications, the UI marks
 the path as `standard-direct-unverified` and allows the two diagnostic actions.
@@ -84,6 +113,9 @@ Use a fresh paper roll and keep the device visible. In the browser:
      payload for this 8-row test;
    - `framePreserved = true`;
    - `0x1a` feed;
+   - no repeated `P1 stream fragment ... (buffer 9B)` caused by
+     `00 02 00 f7 01`; instead, expect `P1 RX short-status ...` and a
+     non-empty `p1.shortStatusHistory`;
 6. if there is no output, disconnect and compare `writeCharacteristic`,
    `preferredWriteMethod`, `p1.probe.attempts`, `crcSeed`, `p1History`, and
    `p1.txHistory` before changing protocol constants.

@@ -1,7 +1,7 @@
 import {
   A5, A5StreamParser, CRC_SEED, P1, P1_SESSION_CRC_KEY, P1StreamParser, a5PrintChunkSize, buildA5PrintDataPayload,
   buildHandshakeNoParamsRequest, buildHandshakeRequest, buildSystemRequest,
-  hex, packA5Frame, packP1Frame, p1RegistrationFrame, parseA5Payload, u16le, utf8Text,
+  hex, packA5Frame, packP1Frame, p1RegistrationFrame, parseA5Payload, parseP1ShortStatus, u16le, utf8Text,
 } from './protocol.js';
 
 export const UUIDS = Object.freeze({
@@ -97,7 +97,7 @@ export class PaperangWebTransport extends EventTarget {
     this.p1WriteCandidates = []; this.p1Characteristics = []; this.p1Probe = null; this.p1WriteMethod = null; this.p1CrcMode = 'standard-direct';
     this.p1CrcSeed = CRC_SEED; this.p1SessionCrcKey = P1_SESSION_CRC_KEY; this.p1RegistrationSent = false;
     this.deviceInfo = {}; this.handshake = null;
-    this.authState = 'unknown'; this.diagnostics = {}; this.rxHistory = []; this.a5History = []; this.p1History = []; this.p1TxHistory = []; this.lastDiagnosticReport = null;
+    this.authState = 'unknown'; this.diagnostics = {}; this.rxHistory = []; this.a5History = []; this.p1History = []; this.p1StatusHistory = []; this.p1ShortStatusObserved = false; this.p1TxHistory = []; this.lastDiagnosticReport = null;
     this.onDisconnected = this.onDisconnected.bind(this);
   }
 
@@ -122,7 +122,8 @@ export class PaperangWebTransport extends EventTarget {
       p1: { crcMode: this.p1CrcMode, crcSeed: this.p1CrcSeed, sessionCrcKey: this.p1SessionCrcKey,
         registrationSent: this.p1RegistrationSent, preferredWriteMethod: this.p1WriteMethod || null, probe: this.p1Probe || null, characteristics: this.p1Characteristics,
         writeCandidates: this.p1WriteCandidates.map((c) => characteristicInfo(c)), parserBufferLength: this.p1Parser.buffer.length,
-        history: this.p1History.slice(-120), txHistory: this.p1TxHistory.slice(-120) },
+        shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length,
+        shortStatusHistory: this.p1StatusHistory.slice(-120), history: this.p1History.slice(-120), txHistory: this.p1TxHistory.slice(-120) },
       diagnostics: JSON.parse(JSON.stringify(this.diagnostics)), rxHistory: this.rxHistory.slice(-120), a5History: this.a5History.slice(-80),
       note: 'No Paperang account token, app secret, or extracted proprietary credential is included. Device responses may contain a device serial number.'
     };
@@ -187,6 +188,11 @@ export class PaperangWebTransport extends EventTarget {
     if (this.rxHistory.length > 240) this.rxHistory.splice(0, this.rxHistory.length - 240);
     this.emit('notification', { uuid, bytes });
     if (this.profile === 'p1') {
+      const shortStatus = parseP1ShortStatus(bytes);
+      if (shortStatus) {
+        this.handleP1ShortStatus(uuid, shortStatus);
+        return;
+      }
       const frames = this.p1Parser.push(bytes);
       if (!frames.length) {
         if (bytes.length && (bytes[0] === 0x02 || this.p1Parser.buffer.length)) this.emit('log', `P1 stream fragment ${bytes.length}B (buffer ${this.p1Parser.buffer.length}B)`);
@@ -214,6 +220,23 @@ export class PaperangWebTransport extends EventTarget {
         clearTimeout(waiter.timer); this.a5Waiters.delete(waiter); waiter.resolve({ frame, parsed });
       }
     }
+  }
+
+  handleP1ShortStatus(uuid, status) {
+    const item = {
+      at: new Date().toISOString(), uuid, kind: status.kind, raw: hex(status.raw), length: status.raw.length,
+      status: status.status, returnId: status.returnId, parameterHex: hex(status.parameters), code: status.code,
+      value: status.value, pattern: status.pattern,
+    };
+    this.p1ShortStatusObserved = true;
+    this.p1StatusHistory.push(item);
+    if (this.p1StatusHistory.length > 240) this.p1StatusHistory.splice(0, this.p1StatusHistory.length - 240);
+    if (this.p1Probe) {
+      this.p1Probe.shortStatusObserved = true;
+      this.p1Probe.shortStatusCount = this.p1StatusHistory.length;
+    }
+    this.emit('p1status', { status, uuid });
+    this.emit('log', `P1 RX short-status ${item.raw} status=0x${item.status.toString(16).padStart(2, '0')} returnId=0x${item.returnId.toString(16).padStart(2, '0')} params=${item.parameterHex}（非 Protocol 02 frame）`);
   }
 
   handleP1Frame(uuid, frame) {
@@ -272,7 +295,7 @@ export class PaperangWebTransport extends EventTarget {
     this.protocolReady = false; this.compatReady = false; this.officialReady = false;
     this.authState = 'legacy-not-required'; this.deviceInfo = {};
     this.p1CrcMode = 'standard-direct'; this.p1CrcSeed = CRC_SEED; this.p1RegistrationSent = false; this.p1WriteMethod = null;
-    this.p1Parser.reset(); this.p1Parser.setCrcSeeds([CRC_SEED]);
+    this.p1Parser.reset(); this.p1Parser.setCrcSeeds([CRC_SEED]); this.p1StatusHistory = []; this.p1ShortStatusObserved = false;
     this.diag('handshake', 'running', 'Protocol 02 WebBLE：标准 CRC 直连探测（不发送 SET_CRC_KEY）');
 
     const candidates = this.p1WriteCandidates.length ? this.p1WriteCandidates : (this.writeChar ? [this.writeChar] : []);
@@ -281,7 +304,7 @@ export class PaperangWebTransport extends EventTarget {
     let writeOnlyMethod = null;
     const attempts = [];
     const probeTimeout = this.isIOS ? 900 : 650;
-    this.p1Probe = { selected: null, method: null, responseVerified: false, writeOnly: false, attempts };
+    this.p1Probe = { selected: null, method: null, responseVerified: false, writeOnly: false, shortStatusObserved: false, shortStatusCount: 0, attempts };
 
     // Candidate order is meaningful: 6DAA is the public direct-WebBLE path,
     // 8841 is the known alternate, and other writable characteristics are only
@@ -330,7 +353,7 @@ export class PaperangWebTransport extends EventTarget {
 
     if (selected) {
       this.writeChar = selected;
-      this.p1Probe = { selected: selected.uuid, method: this.p1WriteMethod, responseVerified: true, writeOnly: false, attempts };
+      this.p1Probe = { selected: selected.uuid, method: this.p1WriteMethod, responseVerified: true, writeOnly: false, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
       this.protocolReady = true; this.compatReady = true;
       this.diag('handshake', 'ok', `Protocol 02 标准 CRC 已验证；write=${selected.uuid}；method=${this.p1WriteMethod}`);
       this.diag('compat', 'ok', 'P1 GET_VERSION 收到 CRC 校验通过的 Protocol 02 回包');
@@ -344,15 +367,16 @@ export class PaperangWebTransport extends EventTarget {
       this.p1WriteMethod = writeOnlyMethod;
       this.p1CrcMode = 'standard-direct-unverified'; this.p1CrcSeed = CRC_SEED;
       this.p1Parser.setCrcSeeds([CRC_SEED]);
-      this.p1Probe = { selected: writeOnlyCandidate.uuid, method: writeOnlyMethod, responseVerified: false, writeOnly: true, attempts };
+      this.p1Probe = { selected: writeOnlyCandidate.uuid, method: writeOnlyMethod, responseVerified: false, writeOnly: true, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
       this.protocolReady = true; this.compatReady = false;
-      this.diag('handshake', 'warn', `Protocol 02 写入成功但无已验证回包；write=${writeOnlyCandidate.uuid}；method=${writeOnlyMethod}`);
-      this.diag('compat', 'warn', `P1 WebBLE 可写但 GET_VERSION 未收到回包；已保留首个成功候选 ${writeOnlyCandidate.uuid} / ${writeOnlyMethod}；自检/8 行黑条仍会记录完整 TX/RX`);
+      const shortStatusDetail = this.p1ShortStatusObserved ? `；已收到 ${this.p1StatusHistory.length} 个 5B 短状态包（非完整 Protocol 02 回包）` : '';
+      this.diag('handshake', 'warn', `Protocol 02 写入成功但无已验证回包；write=${writeOnlyCandidate.uuid}；method=${writeOnlyMethod}${shortStatusDetail}`);
+      this.diag('compat', 'warn', `P1 WebBLE 可写但 GET_VERSION 未收到完整回包；已保留首个成功候选 ${writeOnlyCandidate.uuid} / ${writeOnlyMethod}；自检/8 行黑条仍会记录完整 TX/RX${shortStatusDetail}`);
       this.diag('ready', 'warn', 'P1 已进入未验证打印状态；物理输出仍需真机确认');
       return;
     }
 
-    this.p1Probe = { selected: null, method: null, responseVerified: false, writeOnly: false, attempts };
+    this.p1Probe = { selected: null, method: null, responseVerified: false, writeOnly: false, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
     this.diag('handshake', 'error', '所有 P1 写特征值探测均失败');
     this.diag('compat', 'error', 'P1 service 存在，但没有成功写入 GET_VERSION');
     this.diag('ready', 'error', 'GATT 已连接，但 Protocol 02 未就绪');
@@ -582,7 +606,7 @@ export class PaperangWebTransport extends EventTarget {
     this.p1Waiters.clear(); this.p1Parser.reset(); this.p1WriteCandidates = []; this.p1Characteristics = [];
     this.p1CrcMode = 'standard-direct'; this.p1CrcSeed = CRC_SEED; this.p1RegistrationSent = false; this.p1Probe = null; this.p1WriteMethod = null; this.lastWriteMethod = null;
     this.sessionConnected = false; this.protocolReady = false; this.compatReady = false; this.officialReady = false; this.deviceInfo = {}; this.handshake = null; this.authState = 'unknown';
-    if (!preserveDiagnostic) { this.diagnostics = {}; this.rxHistory = []; this.a5History = []; this.p1History = []; this.p1TxHistory = []; this.lastDiagnosticReport = null; }
+    if (!preserveDiagnostic) { this.diagnostics = {}; this.rxHistory = []; this.a5History = []; this.p1History = []; this.p1StatusHistory = []; this.p1ShortStatusObserved = false; this.p1TxHistory = []; this.lastDiagnosticReport = null; }
     if (clearDevice) this.device = null;
   }
 
