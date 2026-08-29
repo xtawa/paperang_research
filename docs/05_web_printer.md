@@ -53,6 +53,7 @@ diagnostic JSON under `p1.adapter` and `p1.writeMode`.
 | Auto (default) | `8841` first; historical `6DAA` only if `8841` is absent | automatic after a write-only `8841` probe |
 | `8841` session CRC | only `8841` | automatic after a write-only probe |
 | `8841` standard CRC | only `8841` | disabled |
+| Public WebBLE `6DAA` direct | only `6DAA`; auto-selects `writeValue`; no connection probe or density warm-up | disabled |
 | Historical `6DAA` | only `6DAA` | disabled |
 | Compatibility sweep | `8841`, other writable candidates, then explicit `6DAA` | automatic on `8841` |
 
@@ -60,6 +61,15 @@ The `6DAA` options are deliberately labelled historical/compatibility modes:
 the ISSC characteristic definition identifies it as connection-parameter
 control, not the transparent printer data channel. They exist to reproduce
 older WebBLE implementations without changing the safe default.
+
+The **Public WebBLE `6DAA` direct** option is stricter than the historical
+probe mode. It reproduces the connection/print behavior of
+[`Yrr0r/paperang-web`](https://github.com/Yrr0r/paperang-web): select `6DAA`,
+use the browser `writeValue` method, keep the standard CRC seed, and do not
+send `GET_VERSION`, `SET_CRC_KEY`, or an automatic `SET_DENSITY` during
+connection. Its first protocol write is therefore the user-triggered
+`PRINT_DATA` or `SELF_TEST` command. The UI marks this path as armed but does
+not call it physically verified until the printer produces output.
 
 The session-key vector is:
 

@@ -66,6 +66,13 @@ the documented `ACA3` response envelope.
 | raster polarity/width | public P1 evidence says 384 dots, 48 bytes/row, black=1, MSB-first | software-validated; physical output pending |
 | firmware policy | some `8841` devices require session registration before answering Protocol 02 | automatic `SET_CRC_KEY` fallback added; explicit session method retained |
 
+The selector also contains a strict **Public WebBLE `6DAA` direct** mode. It
+does not probe the device and defaults to the same `writeValue` method used by
+the public browser implementation. This is intentionally separate from
+`Historical 6DAA`, which still runs the generic `GET_VERSION` probe, so a
+hardware test can distinguish the exact public sequence from a diagnostic
+probe sequence.
+
 The 512-byte whole-frame attempt follows the Web Bluetooth attribute-size
 limit described in the [Web Bluetooth specification](https://webbluetoothcg.github.io/web-bluetooth/).
 The effective limit can still be smaller on a particular browser/backend; if a
@@ -95,6 +102,11 @@ On a device exposing the P1 service, the web client:
    state.
 10. records the observed five-byte status-like notifications separately from
    Protocol 02 frames, including their UUID and raw bytes.
+
+When the public direct adapter is selected, steps 3–7 are skipped by design:
+the connection only arms the known `6DAA`/`writeValue` path. The first
+application frame appears when the user presses `P1 8 行黑条`, `P1 自检`, or
+`打印图片`; this keeps the capture comparable to the public WebBLE client.
 
 If a candidate accepts writes but does not return notifications, the UI marks
 the path as `standard-direct-unverified` for the legacy/direct case, or

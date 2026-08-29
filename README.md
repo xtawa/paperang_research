@@ -53,6 +53,12 @@ The web client auto-detects two independently supported paths:
 
 It includes threshold, Floyd–Steinberg and Atkinson conversion, rotation, width scaling, density, post-print feed, binary export, RX logging, P1 frame reassembly, characteristic probing, and row-aligned protocol chunking. All image processing stays local in the browser. The responsive UI uses a two-column control/preview workspace on desktop and a single-column workflow with a safe-area-aware bottom Connect/Print dock on mobile. See [`docs/05_web_printer.md`](docs/05_web_printer.md), [`docs/06_protocol_cross_validation_2026.md`](docs/06_protocol_cross_validation_2026.md), and [`docs/08_p1_webble_audit.md`](docs/08_p1_webble_audit.md).
 
+For older P1 WebBLE firmware, Advanced settings also exposes a strict public
+compatibility path: `6DAA + writeValue + standard CRC`, with no connection
+probe, session-key registration, or automatic density write. It is kept
+separate from the newer `8841` transparent path so each hardware behavior can
+be tested and compared from the exported diagnostic JSON.
+
 Run browser-protocol unit tests with:
 
 ```bash

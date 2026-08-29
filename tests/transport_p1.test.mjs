@@ -293,6 +293,39 @@ test('P1 legacy adapter explicitly selects 6DAA even when 8841 exists', async ()
   assert.equal(alternate.writes.length, 0);
 });
 
+test('P1 public WebBLE adapter skips probes and mirrors 6DAA writeValue printing', async () => {
+  const { transport, write, alternate } = makeP1Harness();
+  transport.isIOS = true;
+  transport.setP1Adapter('public-webble');
+
+  await transport.initializeP1Connection();
+
+  assert.equal(transport.ready, true);
+  assert.equal(transport.compatReady, false);
+  assert.equal(transport.p1Probe.directPath, 'public-webble');
+  assert.equal(transport.p1Probe.skipWarmup, true);
+  assert.equal(transport.p1Probe.selected, UUIDS.P1_WRITE_6DAA);
+  assert.equal(transport.p1WriteMethod, 'writeValue');
+  assert.equal(transport.p1CrcMode, 'standard-direct-public-webble');
+  assert.equal(transport.p1RegistrationSent, false);
+  assert.equal(write.writes.length, 0);
+  assert.equal(alternate.writes.length, 0);
+
+  await transport.printP1(new Uint8Array(8 * 48).fill(0xff), 48, 5);
+
+  const frames = alternate.writes.map(({ bytes }) => parseP1Frame(bytes, CRC_SEED)).filter(Boolean);
+  assert.deepEqual(frames.map((frame) => frame.command), [
+    P1.PRINT_DATA,
+    P1.PRINT_DATA,
+    P1.PRINT_DATA,
+    P1.FEED_LINE,
+  ]);
+  assert.deepEqual(frames.map((frame) => frame.payloadLength), [144, 144, 96, 1]);
+  assert.equal(hex(frames.at(-1).payload), 'd2');
+  assert.ok(alternate.writes.every(({ method }) => method === 'writeValue'));
+  assert.ok(frames.every((frame) => frame.crcOk));
+});
+
 test('P1 forced write mode uses only the selected ATT method', async () => {
   const { transport, write } = makeP1Harness();
   transport.setP1WriteMode('writeValueWithResponse');

@@ -40,6 +40,11 @@ function applyP1AdapterOptions({ announce = false } = {}) {
   return adapter;
 }
 
+function isPublicP1DirectPath(result = null) {
+  return transport.profile === 'p1'
+    && (result?.p1?.directPath === 'public-webble' || transport.p1Probe?.directPath === 'public-webble');
+}
+
 const diagLabels = { running: '进行中', ok: '成功', warn: '注意', error: '失败', idle: '待定' };
 function resetDiagnostics() {
   for (const row of ui.diagList?.querySelectorAll('.diag-row') || []) {
@@ -198,23 +203,31 @@ async function connect() {
     ui.disconnect.disabled = false; ui.feed.disabled = !result.ready;
     if (ui.rerunDiag) ui.rerunDiag.disabled = result.profile !== 'p2-a5';
     if (ui.p1TestPrint) ui.p1TestPrint.disabled = result.profile !== 'p1' || !result.ready;
+    const publicP1Direct = isPublicP1DirectPath(result);
     if (ui.mobileConnect) ui.mobileConnect.innerHTML = result.compatReady
       ? '<span class="dock-icon">✓</span><span>兼容就绪</span>'
-      : '<span class="dock-icon">!</span><span>仅 GATT</span>';
+      : publicP1Direct
+        ? '<span class="dock-icon">→</span><span>直打印待测</span>'
+        : '<span class="dock-icon">!</span><span>仅 GATT</span>';
     ui.selfTest.disabled = result.profile !== 'p1' || !result.ready;
     ui.profile.disabled = true;
     renderDeviceInfo(result.deviceInfo || {}, result.authState || '');
     if (result.compatReady) {
       setStatus(`已连接 ${result.name} · 兼容打印通道就绪`, 'ok');
       log(`连接成功：${result.name} · ${result.profile} · compat ready · official=${Boolean(result.officialReady)}`);
+    } else if (publicP1Direct) {
+      setStatus(`已连接 ${result.name} · 公开 WebBLE 直打印已武装 · 待出纸确认`);
+      log(`连接成功：${result.name} · 公开 WebBLE 6DAA 直打印 · ${result.p1?.method || 'writeValue'} · 等待物理输出确认`);
     } else {
       setStatus(`已连接 ${result.name} · 仅 GATT / 查看诊断`, 'error');
       log(`GATT 已连接：${result.name} · ${result.profile}，官方/兼容初始化未完成；请导出诊断 JSON`);
     }
     updateProfileUi();
-    if (result.ready) {
+    if (result.ready && !publicP1Direct) {
       await transport.setDensity(ui.density.value);
       log(`已设置打印浓度 ${ui.density.value}`);
+    } else if (publicP1Direct) {
+      log('公开 WebBLE 直打印路径跳过 SET_DENSITY，保持与 paperang-web 的连接/打印序列一致');
     }
   } catch (error) {
     setStatus(`连接失败：${error.message}`, 'error'); log(`连接失败：${error.stack || error.message}`);
@@ -226,7 +239,8 @@ async function print() {
   try {
     ui.print.disabled = true; ui.progress.value = 0;
     transport.gattChunk = Number(ui.gattChunk.value);
-    await transport.setDensity(ui.density.value);
+    if (transport.p1Probe?.directPath === 'public-webble') log('公开 WebBLE 直打印路径跳过 SET_DENSITY');
+    else await transport.setDensity(ui.density.value);
     log(`开始打印 ${outputWidth}×${outputHeight}px, ${raster.length} bytes`);
     await transport.printRaster(raster, outputWidth / 8, Number(ui.feedMm.value));
     ui.progress.value = 1; setStatus('打印数据发送完成', 'ok'); log('打印数据发送完成');

@@ -62,6 +62,11 @@ export const P1_ADAPTERS = Object.freeze({
     detail: '仅使用 8841 与标准 CRC，不登记会话密钥。适合直接 WebBLE 变体。',
     kind: 'transparent', allowSessionFallback: false,
   }),
+  'public-webble': Object.freeze({
+    label: '公开 WebBLE 6DAA 直打印',
+    detail: '严格复现公开 paperang-web：6DAA + writeValue + 标准 CRC；连接时跳过主动探测、会话登记和自动浓度设置。',
+    kind: 'public-webble', allowSessionFallback: false,
+  }),
   'legacy-6daa': Object.freeze({
     label: '历史 6DAA',
     detail: '仅尝试旧版 WebBLE 的 6DAA 写入。它是连接参数特征，只用于兼容旧固件。',
@@ -143,6 +148,7 @@ function p1ProbeCandidates(candidates, adapterId) {
     return uuid !== transparentUuid && uuid !== legacyUuid;
   });
   const adapter = p1AdapterInfo(adapterId);
+  if (adapter.kind === 'public-webble') return legacy;
   if (adapter.kind === 'transparent') return transparent;
   if (adapter.kind === 'legacy') return legacy;
   if (adapter.kind === 'sweep') return [...transparent, ...other, ...legacy];
@@ -401,6 +407,38 @@ export class PaperangWebTransport extends EventTarget {
       this.diag('handshake', 'error', `${adapter.label} 所需的 P1 characteristic 未被设备暴露`);
       this.diag('compat', 'error', 'P1 service 存在，但所选适配方式没有可用写入通道');
       this.diag('ready', 'error', 'GATT 已连接，但 Protocol 02 未就绪');
+      return;
+    }
+
+    // Yrr0r/paperang-web is a deliberately different P1 bring-up path from
+    // the newer ISSC transparent-data path: it selects 6DAA, uses the legacy
+    // browser writeValue method, and starts printing without GET_VERSION,
+    // SET_CRC_KEY, or a density warm-up. Keep this mode byte-for-byte
+    // comparable and do not contaminate it with active Protocol 02 probes.
+    if (adapter.kind === 'public-webble') {
+      const candidate = probeCandidates[0];
+      const info = characteristicInfo(candidate);
+      const methods = this.p1WriteMode === 'auto'
+        ? p1ProbeMethods(candidate, 'writeValue').slice(0, 1)
+        : p1ProbeMethods(candidate, this.p1WriteMode);
+      if (!methods.length) {
+        this.p1Probe = { adapter: this.p1AdapterId, writeMode: this.p1WriteMode, selected: candidate.uuid, method: null, responseVerified: false, writeOnly: true, directPath: 'public-webble', skipWarmup: true, dataPath: 'public paperang-web / Protocol 02 direct 6DAA', sessionRegistrationAttempted: false, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts: [{ phase: 'public-webble-direct', uuid: info.uuid, method: null, role: p1CharacteristicRole(candidate), properties: info.properties, writeOk: null, responseVerified: false, skippedProbe: true, error: '公开 WebBLE 路径要求 writeValue，但当前 characteristic 未暴露该方法' }] };
+        this.diag('handshake', 'error', '公开 WebBLE 直打印要求 6DAA 的 writeValue，但浏览器未暴露该方法');
+        this.diag('compat', 'error', '未发送探测帧；请改选 ATT 写入方式或其他 P1 适配项');
+        this.diag('ready', 'error', 'GATT 已连接，但公开 WebBLE 直打印未武装');
+        return;
+      }
+      const method = methods[0];
+      this.writeChar = candidate;
+      this.p1WriteMethod = method;
+      this.p1CrcMode = 'standard-direct-public-webble'; this.p1CrcSeed = CRC_SEED;
+      this.p1Parser.reset(); this.p1Parser.setCrcSeeds([CRC_SEED]);
+      this.p1Probe = { adapter: this.p1AdapterId, writeMode: this.p1WriteMode, selected: candidate.uuid, method, responseVerified: false, writeOnly: true, directPath: 'public-webble', skipWarmup: true, dataPath: 'public paperang-web / Protocol 02 direct 6DAA', sessionRegistrationAttempted: false, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts: [{ phase: 'public-webble-direct', uuid: info.uuid, method, role: p1CharacteristicRole(candidate), properties: info.properties, writeOk: null, responseVerified: false, skippedProbe: true }] };
+      this.protocolReady = true; this.compatReady = false;
+      this.diag('handshake', 'warn', `公开 WebBLE 直打印已武装；跳过 GET_VERSION/SET_CRC_KEY；write=${candidate.uuid}；method=${method}`);
+      this.diag('compat', 'warn', '使用公开 paperang-web 的 6DAA + writeValue + 标准 CRC 路径；等待 P1 8 行黑条或自检的物理结果');
+      this.diag('ready', 'warn', 'P1 公开 WebBLE 直打印可发送；尚未验证设备实际出纸');
+      this.emit('log', `P1 公开 WebBLE 直打印：6DAA + ${method} + standard CRC；不发送主动探测/会话登记/自动浓度`);
       return;
     }
 
