@@ -124,7 +124,8 @@ Use a fresh paper roll and keep the device visible. In the browser:
 5. check whether a short solid black strip appears and whether the TX log has:
    - `0x00` print data totaling 384 bytes; on iOS the expected frame payloads
      are 144, 144, and 96 bytes (3/3/2 rows), while desktop sends one 384-byte
-     payload for this 8-row test;
+     payload for this 8-row test. The strict Public WebBLE `6DAA` adapter
+     sends one 384-byte payload on both platforms and leaves `packetIndex=0`;
    - `framePreserved = true`;
    - no default `0x22` or paper-type `0x2c` frames on the P1 path;
    - `0x1a` feed with a one-byte payload, `d2` for the default 5 mm feed;

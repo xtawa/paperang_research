@@ -71,6 +71,11 @@ connection. Its first protocol write is therefore the user-triggered
 `PRINT_DATA` or `SELF_TEST` command. The UI marks this path as armed but does
 not call it physically verified until the printer produces output.
 
+For this adapter, raster chunks use the public reference's maximum of 480
+bytes (10 P1 rows), including on iOS; the reference leaves each Protocol 02
+`packetIndex` at zero. The general `8841` path keeps its iOS 3-row/18 ms
+ pacing and incrementing packet indexes.
+
 The session-key vector is:
 
 ```text

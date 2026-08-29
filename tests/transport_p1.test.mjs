@@ -314,13 +314,9 @@ test('P1 public WebBLE adapter skips probes and mirrors 6DAA writeValue printing
   await transport.printP1(new Uint8Array(8 * 48).fill(0xff), 48, 5);
 
   const frames = alternate.writes.map(({ bytes }) => parseP1Frame(bytes, CRC_SEED)).filter(Boolean);
-  assert.deepEqual(frames.map((frame) => frame.command), [
-    P1.PRINT_DATA,
-    P1.PRINT_DATA,
-    P1.PRINT_DATA,
-    P1.FEED_LINE,
-  ]);
-  assert.deepEqual(frames.map((frame) => frame.payloadLength), [144, 144, 96, 1]);
+  assert.deepEqual(frames.map((frame) => frame.command), [P1.PRINT_DATA, P1.FEED_LINE]);
+  assert.deepEqual(frames.map((frame) => frame.packetIndex), [0, 0]);
+  assert.deepEqual(frames.map((frame) => frame.payloadLength), [384, 1]);
   assert.equal(hex(frames.at(-1).payload), 'd2');
   assert.ok(alternate.writes.every(({ method }) => method === 'writeValue'));
   assert.ok(frames.every((frame) => frame.crcOk));

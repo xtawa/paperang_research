@@ -914,9 +914,21 @@ export class PaperangWebTransport extends EventTarget {
     if (w !== 48) throw new Error('P1 当前实现要求 384px / 48 bytes 每行');
     if (!(r instanceof Uint8Array)) r = new Uint8Array(r);
     if (r.length % w !== 0) throw new RangeError('P1 raster length must contain whole rows');
-    this.emit('log', 'P1 打印采用公开 WebBLE 最小序列：PRINT_DATA → FEED_LINE(单字节)');
-    const size = (this.isIOS ? 3 : 10) * w; let idx = 0;
-    for (let o = 0; o < r.length; o += size) { const c = r.slice(o, o + size); await this.writeFrame(packP1Frame(P1.PRINT_DATA, c, idx, this.p1CrcSeed), { preferResponse: this.isIOS }); idx = (idx + 1) & 255; this.emit('progress', { sent: Math.min(o + c.length, r.length), total: r.length }); await sleep(this.isIOS ? 18 : 8); }
+    const publicDirect = this.p1Probe?.directPath === 'public-webble';
+    this.emit('log', publicDirect
+      ? 'P1 严格复现公开 WebBLE 序列：6DAA/writeValue，PRINT_DATA(最多 480B) → FEED_LINE(单字节)'
+      : 'P1 打印采用公开 WebBLE 最小序列：PRINT_DATA → FEED_LINE(单字节)');
+    const size = publicDirect ? 10 * w : (this.isIOS ? 3 : 10) * w; let idx = 0;
+    for (let o = 0; o < r.length; o += size) {
+      const c = r.slice(o, o + size);
+      // The public WebBLE reference leaves packetIndex at its default zero;
+      // the general path keeps row-chunk indexes for the newer implementations.
+      const packetIndex = publicDirect ? 0 : idx;
+      await this.writeFrame(packP1Frame(P1.PRINT_DATA, c, packetIndex, this.p1CrcSeed), { preferResponse: this.isIOS });
+      idx = (idx + 1) & 255;
+      this.emit('progress', { sent: Math.min(o + c.length, r.length), total: r.length });
+      await sleep(this.isIOS ? 18 : 8);
+    }
     if (f > 0) await this.feed(f, w);
   }
 
