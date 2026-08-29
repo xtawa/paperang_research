@@ -98,9 +98,10 @@ four-byte payload, producing:
 0218000400787ace332c8980f003
 ```
 
-The browser's default P1 WebBLE path does not send either registration frame;
-it uses the standard seed directly. Registration is exposed as an explicit
-diagnostic operation for firmware variants that require it.
+The browser's P1 path tries the standard seed first. When the transparent
+`8841` path accepts writes without a verified response, it sends the session
+registration frame automatically and retries with the session seed; the
+historical `6DAA` fallback remains standard-seed direct WebBLE.
 
 ### 2.4 Command table — APK-confirmed
 

@@ -195,8 +195,8 @@ Before sending a large image, test small reversible queries:
 
 1. enumerate transport UUIDs / establish SPP;
 2. subscribe to notifications or start input stream;
-3. use standard CRC directly for WebBLE, or register a session key only if the
-   selected SPP/Bleak/device variant requires it;
+3. use standard CRC first; on a transparent `8841` path with no verified
+   response, register the session key and retry before sending raster data;
 4. query battery (`0x10` for protocol 0x02);
 5. query SN/model/version;
 6. optionally print the built-in test page (`0x1B`);

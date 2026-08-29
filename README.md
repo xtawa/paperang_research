@@ -27,7 +27,7 @@ The Vercel deployment is HTTPS-enabled and uses a responsive interface for deskt
    - set density `0x19`
    - feed line `0x1A`
    - power-down set/get `0x1E/0x1F`
-6. **CRC32 seed:** `0x35769521`. The default P1 WebBLE path uses this seed directly for every frame and does not send `SET_CRC_KEY`. Its self-test vector is:
+6. **CRC32 seed:** `0x35769521`. The P1 browser path tries this seed first. If the transparent `8841` path accepts writes without a verified response, it automatically sends `SET_CRC_KEY` and retries with the public session key. Its direct-path self-test vector is:
 
    ```text
    02 1b 00 01 00 00 46 89 5e 9e 03

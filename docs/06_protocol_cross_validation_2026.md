@@ -11,10 +11,12 @@ Two independent public implementations use the same proprietary `49535343-fe7d-4
 | historical browser implementation | `49535343-6daa-4d02-abf6-19569aca69fe` |
 | current `paperang-cli` P1 driver | `49535343-8841-43f4-a8d4-ecbe34729bb3` |
 
-The web client therefore enumerates the service and probes both in this order:
-`6DAA` (the public browser reference), then `8841` (the newer Bleak driver),
-then any remaining characteristic whose GATT properties report write or
-write-without-response. Known UUIDs are still probed when a browser reports an
+The web client now treats the UUID roles as a transport decision rather than a
+single historical probe order. If `8841` is present, it is the primary
+transparent data path and `6DAA` is not sent Protocol 02 traffic. If `8841` is
+absent, `6DAA` remains the legacy WebBLE fallback. Remaining characteristics
+whose GATT properties report write or write-without-response are considered
+after the known path. Known UUIDs are still probed when a browser reports an
 incomplete all-false properties object.
 
 The current P1 driver also cross-validates:
@@ -25,10 +27,10 @@ The current P1 driver also cross-validates:
 - 384 px head
 - post-connect density/status queries
 
-Its automatic CRC-key registration is treated as a transport-specific SPP/Bleak
-variant. It is not copied into the browser default path because the independent
-WebBLE reference sends standard-seed frames directly and never registers a
-session key.
+Its automatic CRC-key registration is now used as a targeted browser fallback:
+only a write-only `8841` path receives `SET_CRC_KEY`, and the browser retries
+`GET_VERSION` with the session seed. A standard-seed response still wins, and
+the legacy `6DAA` fallback remains direct WebBLE behavior.
 
 ## P2 is not one transport family
 
@@ -105,10 +107,11 @@ session-style `SET_CRC_KEY` packet, kept using the standard CRC afterward, and
 split a 490-byte P1 raster frame using the generic 237-byte A5 write budget.
 The current web transport separates those states:
 
-- direct WebBLE: standard CRC, no automatic registration, verified read-only
-  probe, stream parser, full-frame writes up to 512 bytes;
-- session variant: explicit `registerP1SessionCrc()` call, then session CRC for
-  later frames, with the state exposed in diagnostics.
+- direct WebBLE: standard CRC, verified probe, stream parser, full-frame writes
+  up to 512 bytes;
+- `8841` session fallback: automatic `registerP1SessionCrc()` after a write-only
+  standard probe, then session CRC for the retry and later frames;
+- legacy `6DAA` fallback: direct standard-seed behavior when `8841` is absent.
 
 The code now records exact characteristic, GATT properties, write method,
 frame length, and TX/RX hex. Physical output is still the acceptance test for

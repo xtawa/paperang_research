@@ -8,7 +8,7 @@ const ui = {
   print: $('printBtn'), feed: $('feedBtn'), selfTest: $('selfTestBtn'), status: $('status'), profile: $('profile'), profileHint: $('profileHint'),
   width: $('width'), threshold: $('threshold'), thresholdValue: $('thresholdValue'), contrast: $('contrast'), contrastValue: $('contrastValue'),
   brightness: $('brightness'), brightnessValue: $('brightnessValue'), dither: $('dither'), invert: $('invert'), rotate: $('rotate'), scale: $('scale'), scaleValue: $('scaleValue'),
-  density: $('density'), densityValue: $('densityValue'), feedMm: $('feedMm'), gattChunk: $('gattChunk'), log: $('log'),
+  density: $('density'), densityValue: $('densityValue'), feedMm: $('feedMm'), gattChunk: $('gattChunk'), p1Adapter: $('p1Adapter'), p1AdapterHint: $('p1AdapterHint'), p1WriteMode: $('p1WriteMode'), log: $('log'),
   meta: $('imageMeta'), progress: $('progress'), clearLog: $('clearLog'), exportRaster: $('exportRaster'),
   mobileConnect: $('mobileConnectProxy'), mobilePrint: $('mobilePrintProxy'), paperWidthLabel: $('paperWidthLabel'),
   diagSummary: $('diagSummary'), diagList: $('diagList'), deviceInfoPanel: $('deviceInfoPanel'), p1TestPrint: $('p1TestPrintBtn'), rerunDiag: $('rerunDiagBtn'), exportDiag: $('exportDiagBtn'),
@@ -29,6 +29,15 @@ function log(message, bytes = null) {
 function setStatus(text, kind = '') {
   ui.status.textContent = text;
   ui.status.dataset.kind = kind;
+}
+
+function applyP1AdapterOptions({ announce = false } = {}) {
+  if (!ui.p1Adapter || !ui.p1WriteMode) return null;
+  const adapter = transport.setP1Adapter(ui.p1Adapter.value);
+  transport.setP1WriteMode(ui.p1WriteMode.value);
+  if (ui.p1AdapterHint) ui.p1AdapterHint.textContent = adapter.detail;
+  if (announce) log(`P1 适配方式已设为：${adapter.label}；ATT=${ui.p1WriteMode.options[ui.p1WriteMode.selectedIndex]?.text || ui.p1WriteMode.value}（下次连接生效）`);
+  return adapter;
 }
 
 const diagLabels = { running: '进行中', ok: '成功', warn: '注意', error: '失败', idle: '待定' };
@@ -183,6 +192,8 @@ async function connect() {
   try {
     ui.connect.disabled = true; setStatus('正在选择并连接设备…');
     transport.gattChunk = Number(ui.gattChunk.value);
+    const adapter = applyP1AdapterOptions();
+    if (adapter) log(`P1 连接采用：${adapter.label}；${adapter.detail}`);
     const result = await transport.requestAndConnect();
     ui.disconnect.disabled = false; ui.feed.disabled = !result.ready;
     if (ui.rerunDiag) ui.rerunDiag.disabled = result.profile !== 'p2-a5';
@@ -357,8 +368,11 @@ for (const [control, valueNode] of [[ui.threshold, ui.thresholdValue], [ui.contr
 for (const control of [ui.dither, ui.invert, ui.rotate]) control.addEventListener('change', render);
 ui.profile.addEventListener('change', updateProfileUi);
 ui.gattChunk.addEventListener('change', () => { transport.gattChunk = Number(ui.gattChunk.value); });
+ui.p1Adapter?.addEventListener('change', () => applyP1AdapterOptions({ announce: true }));
+ui.p1WriteMode?.addEventListener('change', () => applyP1AdapterOptions({ announce: true }));
 
 resetDiagnostics();
+applyP1AdapterOptions();
 
 if (!navigator.bluetooth) {
   setStatus('此浏览器不支持 Web Bluetooth', 'error');

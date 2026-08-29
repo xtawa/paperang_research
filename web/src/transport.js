@@ -37,12 +37,60 @@ function scalarFromA5(parsed) {
   return hex(b);
 }
 
-const P1_WRITE_ORDER = Object.freeze(['P1_WRITE_6DAA', 'P1_WRITE_8841']);
+// ISSC names 8841 as the transparent RX path. 6DAA is the separate
+// connection-parameter characteristic and is only a legacy fallback here.
+const P1_WRITE_ORDER = Object.freeze(['P1_WRITE_8841', 'P1_WRITE_6DAA']);
 const P1_WRITE_METHOD_ORDER = Object.freeze(['writeValueWithoutResponse', 'writeValueWithResponse', 'writeValue']);
 const P1_PROTOCOL_FRAME_LIMIT = 512;
 const P1_FEED_UNITS_PER_MM = 42;
 
+// Keep the documented transparent-data path as the default, while making the
+// historical variants explicit and inspectable for real-world P1 revisions.
+export const P1_ADAPTERS = Object.freeze({
+  auto: Object.freeze({
+    label: '自动（推荐）',
+    detail: '优先 8841 透明通道；无回包时登记会话 CRC；仅在缺少 8841 时回退历史 6DAA。',
+    kind: 'auto', allowSessionFallback: true,
+  }),
+  '8841-session': Object.freeze({
+    label: '8841 会话 CRC',
+    detail: '仅使用 8841；标准 CRC 探测失败后自动登记会话 CRC 并重试。',
+    kind: 'transparent', allowSessionFallback: true,
+  }),
+  '8841-direct': Object.freeze({
+    label: '8841 标准 CRC',
+    detail: '仅使用 8841 与标准 CRC，不登记会话密钥。适合直接 WebBLE 变体。',
+    kind: 'transparent', allowSessionFallback: false,
+  }),
+  'legacy-6daa': Object.freeze({
+    label: '历史 6DAA',
+    detail: '仅尝试旧版 WebBLE 的 6DAA 写入。它是连接参数特征，只用于兼容旧固件。',
+    kind: 'legacy', allowSessionFallback: false,
+  }),
+  'compat-sweep': Object.freeze({
+    label: '兼容扫查',
+    detail: '依次检查 8841、其他可写特征和历史 6DAA，随后在 8841 尝试会话 CRC。',
+    kind: 'sweep', allowSessionFallback: true,
+  }),
+});
+
+export const P1_WRITE_MODES = Object.freeze({
+  auto: '自动尝试',
+  writeValueWithoutResponse: 'Write without response',
+  writeValueWithResponse: 'Write with response',
+  writeValue: '浏览器兼容 writeValue',
+});
+
 function normalizeUuid(value) { return String(value || '').toLowerCase(); }
+
+function p1CharacteristicRole(characteristic) {
+  const uuid = normalizeUuid(characteristic?.uuid);
+  if (uuid === normalizeUuid(UUIDS.P1_WRITE_8841)) return 'ISSC_TRANS_RX / Protocol 02 data';
+  if (uuid === normalizeUuid(UUIDS.P1_WRITE_6DAA)) return 'ISSC_UPDATE_CONNECTION_PARAMETER / legacy fallback';
+  if (uuid === normalizeUuid(UUIDS.P1_NOTIFY)) return 'ISSC_TRANS_TX / Protocol 02 notify';
+  if (uuid === normalizeUuid('49535343-aca3-481c-91ec-d85e28a60318')) return 'ISSC_AIR_PATCH';
+  return 'unknown P1 characteristic';
+}
 
 function characteristicProperties(characteristic) {
   const properties = characteristic?.properties || {};
@@ -62,12 +110,13 @@ function characteristicInfo(characteristic) {
   };
 }
 
-function p1ProbeMethods(characteristic) {
+function p1ProbeMethods(characteristic, writeMode = 'auto') {
   const info = characteristicInfo(characteristic);
   const properties = characteristicProperties(characteristic);
   const uuid = normalizeUuid(characteristic?.uuid);
   const knownP1Write = [UUIDS.P1_WRITE_6DAA, UUIDS.P1_WRITE_8841].includes(uuid);
-  return P1_WRITE_METHOD_ORDER.filter((method) => {
+  const requested = writeMode === 'auto' ? P1_WRITE_METHOD_ORDER : [writeMode];
+  return requested.filter((method) => {
     if (!info.methods[method]) return false;
     // Bluefy may expose all three methods even when its properties object is
     // incomplete. The two known P1 write UUIDs are therefore probed explicitly
@@ -78,6 +127,28 @@ function p1ProbeMethods(characteristic) {
     if (method === 'writeValueWithResponse') return properties.write;
     return true;
   });
+}
+
+function p1AdapterInfo(adapterId) {
+  return P1_ADAPTERS[adapterId] || P1_ADAPTERS.auto;
+}
+
+function p1ProbeCandidates(candidates, adapterId) {
+  const transparentUuid = normalizeUuid(UUIDS.P1_WRITE_8841);
+  const legacyUuid = normalizeUuid(UUIDS.P1_WRITE_6DAA);
+  const transparent = candidates.filter((candidate) => normalizeUuid(candidate?.uuid) === transparentUuid);
+  const legacy = candidates.filter((candidate) => normalizeUuid(candidate?.uuid) === legacyUuid);
+  const other = candidates.filter((candidate) => {
+    const uuid = normalizeUuid(candidate?.uuid);
+    return uuid !== transparentUuid && uuid !== legacyUuid;
+  });
+  const adapter = p1AdapterInfo(adapterId);
+  if (adapter.kind === 'transparent') return transparent;
+  if (adapter.kind === 'legacy') return legacy;
+  if (adapter.kind === 'sweep') return [...transparent, ...other, ...legacy];
+  // Automatic mode preserves the documented safety boundary: do not send
+  // Protocol 02 traffic to 6DAA when a transparent 8841 endpoint exists.
+  return transparent.length ? [...transparent, ...other] : candidates;
 }
 
 function p1Text(payload) {
@@ -96,7 +167,8 @@ export class PaperangWebTransport extends EventTarget {
     this.a5Parser = new A5StreamParser(); this.a5Waiters = new Set();
     this.p1Parser = new P1StreamParser([CRC_SEED, P1_SESSION_CRC_KEY]); this.p1Waiters = new Set();
     this.p1WriteCandidates = []; this.p1Characteristics = []; this.p1Probe = null; this.p1WriteMethod = null; this.p1CrcMode = 'standard-direct';
-    this.p1CrcSeed = CRC_SEED; this.p1SessionCrcKey = P1_SESSION_CRC_KEY; this.p1RegistrationSent = false;
+    this.p1AdapterId = 'auto'; this.p1WriteMode = 'auto';
+    this.p1CrcSeed = CRC_SEED; this.p1SessionCrcKey = P1_SESSION_CRC_KEY; this.p1RegistrationSent = false; this.p1RegistrationAttempted = false;
     this.deviceInfo = {}; this.handshake = null;
     this.authState = 'unknown'; this.diagnostics = {}; this.rxHistory = []; this.a5History = []; this.p1History = []; this.p1StatusHistory = []; this.p1ShortStatusObserved = false; this.p1TxHistory = []; this.lastDiagnosticReport = null;
     this.onDisconnected = this.onDisconnected.bind(this);
@@ -120,8 +192,9 @@ export class PaperangWebTransport extends EventTarget {
         writeMethods: characteristicInfo(this.writeChar).methods, lastWriteMethod: this.lastWriteMethod || null,
         notifyCharacteristics: this.notifyChars.map((c) => c.uuid) },
       authState: this.authState, deviceInfo: { ...this.deviceInfo }, handshake: this.handshake ? JSON.parse(JSON.stringify(this.handshake)) : null,
-      p1: { crcMode: this.p1CrcMode, crcSeed: this.p1CrcSeed, sessionCrcKey: this.p1SessionCrcKey,
-        registrationSent: this.p1RegistrationSent, preferredWriteMethod: this.p1WriteMethod || null, probe: this.p1Probe || null, characteristics: this.p1Characteristics,
+      p1: { adapter: { id: this.p1AdapterId, label: p1AdapterInfo(this.p1AdapterId).label, detail: p1AdapterInfo(this.p1AdapterId).detail }, writeMode: this.p1WriteMode,
+        crcMode: this.p1CrcMode, crcSeed: this.p1CrcSeed, sessionCrcKey: this.p1SessionCrcKey,
+        registrationAttempted: this.p1RegistrationAttempted, registrationSent: this.p1RegistrationSent, preferredWriteMethod: this.p1WriteMethod || null, probe: this.p1Probe || null, characteristics: this.p1Characteristics,
         writeCandidates: this.p1WriteCandidates.map((c) => characteristicInfo(c)), parserBufferLength: this.p1Parser.buffer.length,
         shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length,
         shortStatusHistory: this.p1StatusHistory.slice(-120), history: this.p1History.slice(-120), txHistory: this.p1TxHistory.slice(-120) },
@@ -133,6 +206,22 @@ export class PaperangWebTransport extends EventTarget {
   getDiagnosticReport() {
     if (!this.connected && this.lastDiagnosticReport) return this.lastDiagnosticReport;
     return this.currentDiagnosticReport();
+  }
+
+  getP1AdapterInfo() {
+    return { id: this.p1AdapterId, ...p1AdapterInfo(this.p1AdapterId), writeMode: this.p1WriteMode };
+  }
+
+  setP1Adapter(adapterId = 'auto') {
+    if (!P1_ADAPTERS[adapterId]) throw new Error(`未知 P1 适配方式：${adapterId}`);
+    this.p1AdapterId = adapterId;
+    return this.getP1AdapterInfo();
+  }
+
+  setP1WriteMode(writeMode = 'auto') {
+    if (!Object.hasOwn(P1_WRITE_MODES, writeMode)) throw new Error(`未知 P1 写入方式：${writeMode}`);
+    this.p1WriteMode = writeMode;
+    return this.getP1AdapterInfo();
   }
 
   async requestAndConnect() {
@@ -295,36 +384,43 @@ export class PaperangWebTransport extends EventTarget {
   async initializeP1Connection() {
     this.protocolReady = false; this.compatReady = false; this.officialReady = false;
     this.authState = 'legacy-not-required'; this.deviceInfo = {};
-    this.p1CrcMode = 'standard-direct'; this.p1CrcSeed = CRC_SEED; this.p1RegistrationSent = false; this.p1WriteMethod = null;
+    this.p1CrcMode = 'standard-direct'; this.p1CrcSeed = CRC_SEED; this.p1RegistrationSent = false; this.p1RegistrationAttempted = false; this.p1WriteMethod = null;
     this.p1Parser.reset(); this.p1Parser.setCrcSeeds([CRC_SEED]); this.p1StatusHistory = []; this.p1ShortStatusObserved = false;
-    this.diag('handshake', 'running', 'Protocol 02 WebBLE：标准 CRC 直连探测（不发送 SET_CRC_KEY）');
+    const adapter = this.getP1AdapterInfo();
+    this.diag('handshake', 'running', `Protocol 02：${adapter.label}；写入=${P1_WRITE_MODES[this.p1WriteMode]}`);
 
     const candidates = this.p1WriteCandidates.length ? this.p1WriteCandidates : (this.writeChar ? [this.writeChar] : []);
+    const probeCandidates = p1ProbeCandidates(candidates, this.p1AdapterId);
     let selected = null;
     let writeOnlyCandidate = null;
     let writeOnlyMethod = null;
     const attempts = [];
     const probeTimeout = this.isIOS ? 900 : 650;
-    this.p1Probe = { selected: null, method: null, responseVerified: false, writeOnly: false, shortStatusObserved: false, shortStatusCount: 0, attempts };
+    this.p1Probe = { adapter: this.p1AdapterId, writeMode: this.p1WriteMode, selected: null, method: null, responseVerified: false, writeOnly: false, dataPath: null, sessionRegistrationAttempted: false, shortStatusObserved: false, shortStatusCount: 0, attempts };
+    if (!probeCandidates.length) {
+      this.diag('handshake', 'error', `${adapter.label} 所需的 P1 characteristic 未被设备暴露`);
+      this.diag('compat', 'error', 'P1 service 存在，但所选适配方式没有可用写入通道');
+      this.diag('ready', 'error', 'GATT 已连接，但 Protocol 02 未就绪');
+      return;
+    }
 
-    // Candidate order is meaningful: 6DAA is the public direct-WebBLE path,
-    // 8841 is the known alternate, and other writable characteristics are only
-    // fallbacks. Probe the ATT write method explicitly so a successful JS
-    // Promise cannot hide a write-mode mismatch.
+    // Probe the ATT write method explicitly so a successful JS Promise cannot
+    // hide a write-mode mismatch. A verified Protocol 02 response wins over
+    // every write-only result.
     probeLoop:
-    for (const candidate of candidates) {
+    for (const candidate of probeCandidates) {
       const info = characteristicInfo(candidate);
-      const methods = p1ProbeMethods(candidate);
+      const methods = p1ProbeMethods(candidate, this.p1WriteMode);
       if (!methods.length) {
-        attempts.push({ uuid: info.uuid, method: null, properties: info.properties, writeOk: false, responseVerified: false, error: '没有可用的写入方法' });
+        attempts.push({ uuid: info.uuid, method: null, role: p1CharacteristicRole(candidate), properties: info.properties, writeOk: false, responseVerified: false, error: '没有可用的写入方法' });
         continue;
       }
       for (const method of methods) {
         this.writeChar = candidate;
         this.p1Parser.reset();
-        const attempt = { uuid: info.uuid, method, properties: info.properties, writeOk: false, responseVerified: false };
+        const attempt = { uuid: info.uuid, method, role: p1CharacteristicRole(candidate), properties: info.properties, writeOk: false, responseVerified: false };
         attempts.push(attempt);
-        this.emit('log', `P1 GET_VERSION probe：char=${info.uuid} method=${method} properties=${JSON.stringify(info.properties)} payload=01 crcSeed=0x${CRC_SEED.toString(16).padStart(8, '0')}`);
+        this.emit('log', `P1 GET_VERSION probe：char=${info.uuid} role=${attempt.role} method=${method} properties=${JSON.stringify(info.properties)} payload=01 crcSeed=0x${CRC_SEED.toString(16).padStart(8, '0')}`);
         try {
           const response = await this.queryP1(P1.GET_VERSION, Uint8Array.from([1]), {
             responseCommands: [P1.GET_VERSION, (P1.GET_VERSION + 1) & 0xff],
@@ -354,9 +450,9 @@ export class PaperangWebTransport extends EventTarget {
 
     if (selected) {
       this.writeChar = selected;
-      this.p1Probe = { selected: selected.uuid, method: this.p1WriteMethod, responseVerified: true, writeOnly: false, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
+      this.p1Probe = { adapter: this.p1AdapterId, writeMode: this.p1WriteMode, selected: selected.uuid, method: this.p1WriteMethod, responseVerified: true, writeOnly: false, dataPath: p1CharacteristicRole(selected), sessionRegistrationAttempted: false, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
       this.protocolReady = true; this.compatReady = true;
-      this.diag('handshake', 'ok', `Protocol 02 标准 CRC 已验证；write=${selected.uuid}；method=${this.p1WriteMethod}`);
+      this.diag('handshake', 'ok', `Protocol 02 标准 CRC 已验证；write=${selected.uuid}；role=${p1CharacteristicRole(selected)}；method=${this.p1WriteMethod}`);
       this.diag('compat', 'ok', 'P1 GET_VERSION 收到 CRC 校验通过的 Protocol 02 回包');
       await this.queryP1Metadata();
       this.diag('ready', 'ok', 'P1 兼容打印就绪（标准 CRC 直连）');
@@ -368,16 +464,87 @@ export class PaperangWebTransport extends EventTarget {
       this.p1WriteMethod = writeOnlyMethod;
       this.p1CrcMode = 'standard-direct-unverified'; this.p1CrcSeed = CRC_SEED;
       this.p1Parser.setCrcSeeds([CRC_SEED]);
-      this.p1Probe = { selected: writeOnlyCandidate.uuid, method: writeOnlyMethod, responseVerified: false, writeOnly: true, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
+      this.p1Probe = { selected: writeOnlyCandidate.uuid, method: writeOnlyMethod, responseVerified: false, writeOnly: true, dataPath: p1CharacteristicRole(writeOnlyCandidate), sessionRegistrationAttempted: false, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
+
+      // The newer P1 BLE path uses the transparent 8841 endpoint together with
+      // the same session-key registration used by public SPP/Bleak clients.
+      // Try that only after direct WebBLE probing has failed, preserving the
+      // old standard-CRC path for devices that answer it.
+      if (adapter.allowSessionFallback && normalizeUuid(writeOnlyCandidate.uuid) === normalizeUuid(UUIDS.P1_WRITE_8841)) {
+        this.p1RegistrationAttempted = true;
+        this.p1Probe.sessionRegistrationAttempted = true;
+        this.diag('handshake', 'running', `8841 透明通道可写但无标准回包；发送 SET_CRC_KEY=0x${this.p1SessionCrcKey.toString(16).padStart(8, '0')} 后重试`);
+        const sessionMethods = [...new Set([writeOnlyMethod, ...p1ProbeMethods(writeOnlyCandidate, this.p1WriteMode)])];
+        let sessionWriteSucceeded = false;
+        let registeredSessionMethod = null;
+        for (const sessionMethod of sessionMethods) {
+          this.writeChar = writeOnlyCandidate;
+          this.p1WriteMethod = sessionMethod;
+          this.p1CrcMode = 'standard-direct-unverified'; this.p1CrcSeed = CRC_SEED; this.p1RegistrationSent = false;
+          this.p1Parser.reset(); this.p1Parser.setCrcSeeds([CRC_SEED]);
+          const registrationAttempt = {
+            phase: 'session-registration', uuid: writeOnlyCandidate.uuid, method: sessionMethod,
+            role: p1CharacteristicRole(writeOnlyCandidate), properties: characteristicProperties(writeOnlyCandidate),
+            writeOk: false, responseVerified: false,
+          };
+          attempts.push(registrationAttempt);
+          this.emit('log', `P1 SET_CRC_KEY/session probe：char=${writeOnlyCandidate.uuid} role=${registrationAttempt.role} method=${sessionMethod}`);
+          try {
+            await this.registerP1SessionCrc();
+            registrationAttempt.writeOk = true;
+            sessionWriteSucceeded = true;
+            if (!registeredSessionMethod) registeredSessionMethod = sessionMethod;
+            const response = await this.queryP1(P1.GET_VERSION, Uint8Array.from([1]), {
+              responseCommands: [P1.GET_VERSION, (P1.GET_VERSION + 1) & 0xff],
+              timeout: probeTimeout,
+              label: 'GET_VERSION(session CRC)',
+              writeMethod: sessionMethod,
+              allowFallback: false,
+            });
+            if (!response) continue;
+            registrationAttempt.responseVerified = true;
+            this.p1CrcMode = 'session-registered';
+            this.p1Probe = { adapter: this.p1AdapterId, writeMode: this.p1WriteMode, selected: writeOnlyCandidate.uuid, method: sessionMethod, responseVerified: true, writeOnly: false, dataPath: p1CharacteristicRole(writeOnlyCandidate), sessionRegistrationAttempted: true, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
+            this.protocolReady = true; this.compatReady = true;
+            const version = p1Text(response.frame.payload);
+            if (version) this.deviceInfo.softwareVersion = version;
+            this.emit('log', `P1 GET_VERSION(session CRC) 已验证：char=${writeOnlyCandidate.uuid} method=${sessionMethod} payload=${hex(response.frame.payload)}${version ? ` text=${version}` : ''}`);
+            this.diag('handshake', 'ok', `Protocol 02 会话 CRC 已验证；write=${writeOnlyCandidate.uuid}；method=${sessionMethod}`);
+            this.diag('compat', 'ok', 'P1 8841 透明通道收到 CRC 校验通过的会话回包');
+            await this.queryP1Metadata();
+            this.diag('ready', 'ok', 'P1 兼容打印就绪（8841 + 会话 CRC）');
+            return;
+          } catch (error) {
+            registrationAttempt.error = error.message || String(error);
+            this.emit('log', `P1 SET_CRC_KEY/会话探测失败：${registrationAttempt.error}`);
+          }
+        }
+        if (sessionWriteSucceeded) {
+          this.p1WriteMethod = registeredSessionMethod || writeOnlyMethod;
+          this.p1RegistrationSent = true;
+          this.p1CrcSeed = this.p1SessionCrcKey;
+          this.p1CrcMode = 'session-registered-unverified';
+          this.p1Parser.reset(); this.p1Parser.setCrcSeeds([this.p1CrcSeed]);
+        } else {
+          this.p1CrcMode = 'standard-direct-unverified'; this.p1CrcSeed = CRC_SEED; this.p1RegistrationSent = false;
+          this.p1Parser.reset(); this.p1Parser.setCrcSeeds([CRC_SEED]);
+        }
+      }
+
+      if (this.p1RegistrationSent) writeOnlyMethod = this.p1WriteMethod;
+      const sessionDetail = this.p1RegistrationSent
+        ? `；已发送 SET_CRC_KEY，后续 CRC=0x${this.p1CrcSeed.toString(16).padStart(8, '0')}`
+        : '';
+      this.p1Probe = { adapter: this.p1AdapterId, writeMode: this.p1WriteMode, selected: writeOnlyCandidate.uuid, method: writeOnlyMethod, responseVerified: false, writeOnly: true, dataPath: p1CharacteristicRole(writeOnlyCandidate), sessionRegistrationAttempted: this.p1RegistrationAttempted, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
       this.protocolReady = true; this.compatReady = false;
       const shortStatusDetail = this.p1ShortStatusObserved ? `；已收到 ${this.p1StatusHistory.length} 个 5B 短状态包（非完整 Protocol 02 回包）` : '';
-      this.diag('handshake', 'warn', `Protocol 02 写入成功但无已验证回包；write=${writeOnlyCandidate.uuid}；method=${writeOnlyMethod}${shortStatusDetail}`);
-      this.diag('compat', 'warn', `P1 WebBLE 可写但 GET_VERSION 未收到完整回包；已保留首个成功候选 ${writeOnlyCandidate.uuid} / ${writeOnlyMethod}；自检/8 行黑条仍会记录完整 TX/RX${shortStatusDetail}`);
-      this.diag('ready', 'warn', 'P1 已进入未验证打印状态；物理输出仍需真机确认');
+      this.diag('handshake', 'warn', `Protocol 02 写入成功但无已验证回包；write=${writeOnlyCandidate.uuid}；role=${p1CharacteristicRole(writeOnlyCandidate)}；method=${writeOnlyMethod}${sessionDetail}${shortStatusDetail}`);
+      this.diag('compat', 'warn', `P1 透明通道可写但 GET_VERSION 未收到完整回包；已保留 ${writeOnlyCandidate.uuid} / ${writeOnlyMethod}；自检/8 行黑条仍会记录完整 TX/RX${sessionDetail}${shortStatusDetail}`);
+      this.diag('ready', 'warn', `P1 已进入未验证打印状态${this.p1RegistrationSent ? '（会话 CRC）' : ''}；物理输出仍需真机确认`);
       return;
     }
 
-    this.p1Probe = { selected: null, method: null, responseVerified: false, writeOnly: false, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
+    this.p1Probe = { selected: null, method: null, responseVerified: false, writeOnly: false, dataPath: null, sessionRegistrationAttempted: this.p1RegistrationAttempted, shortStatusObserved: this.p1ShortStatusObserved, shortStatusCount: this.p1StatusHistory.length, attempts };
     this.diag('handshake', 'error', '所有 P1 写特征值探测均失败');
     this.diag('compat', 'error', 'P1 service 存在，但没有成功写入 GET_VERSION');
     this.diag('ready', 'error', 'GATT 已连接，但 Protocol 02 未就绪');
@@ -726,16 +893,18 @@ export class PaperangWebTransport extends EventTarget {
   async registerP1SessionCrc(sessionKey = this.p1SessionCrcKey) {
     if (this.profile !== 'p1' || !this.connected) throw new Error('P1 打印机未连接');
     const key = Number(sessionKey) >>> 0;
+    this.p1RegistrationAttempted = true;
     this.p1CrcSeed = CRC_SEED;
     this.p1CrcMode = 'session-registration-pending';
     this.p1Parser.setCrcSeeds([CRC_SEED]);
-    this.emit('log', `P1 Protocol 02：显式发送 SET_CRC_KEY，newSessionKey=0x${key.toString(16).padStart(8, '0')}（WebBLE 默认路径不会自动发送此命令）`);
+    this.emit('log', `P1 Protocol 02：在 ${p1CharacteristicRole(this.writeChar)} 上发送 SET_CRC_KEY，newSessionKey=0x${key.toString(16).padStart(8, '0')}`);
     await this.writeFrame(p1RegistrationFrame(key), { preferResponse: this.isIOS });
     this.p1RegistrationSent = true;
     this.p1CrcSeed = key;
     this.p1CrcMode = 'session-registered-unverified';
     this.p1Parser.setCrcSeeds([key]);
     await sleep(this.isIOS ? 180 : 80);
+    return { sessionKey: key, writeCharacteristic: this.writeChar?.uuid || null, writeMethod: this.p1WriteMethod || this.lastWriteMethod || null };
   }
   async printA5(r, w, f) {
     if (w !== 72) throw new Error('P2 FF00/A5 当前实现要求 576px / 72 bytes 每行');

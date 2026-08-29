@@ -17,31 +17,59 @@ The repository root `index.html` is a dependency-free Web Bluetooth printer UI. 
 - raster: black=1, white=0, MSB first
 - desktop path sends 10 full rows / 480 payload bytes as one complete 490-byte Protocol 02 frame; iOS/WebBLE mode uses smaller 3-row frames and slower writes
 
-The default browser path is direct WebBLE: it probes `GET_VERSION` with payload
-`01`, using the standard seed, and does not send `SET_CRC_KEY`. For each known
-P1 write characteristic, the probe explicitly tries
-`writeValueWithoutResponse`, `writeValueWithResponse`, then legacy
-`writeValue`; `6DAA` is tried before `8841`, and unverified fallback
-characteristics are tried last. This keeps the browser behavior aligned with
-the public WebBLE reference while exposing ATT write-mode differences in the
-diagnostic report. P1 response notifications are parsed as a stream, so a
-response may be fragmented across notifications or contain multiple frames.
+The browser treats `8841` as the primary transparent Protocol 02 data path.
+When `8841` is present, Protocol 02 probes are not sent to `6DAA`: the ISSC
+controller documents `6DAA` as a connection-parameter characteristic, while
+`8841` is the transparent RX path. `6DAA` remains a legacy fallback for devices
+that do not expose `8841`. The probe sends `GET_VERSION` with payload `01` and
+the standard seed, explicitly trying `writeValueWithoutResponse`,
+`writeValueWithResponse`, then legacy `writeValue` on each eligible path.
+Response notifications are parsed as a stream, so a response may be fragmented
+across notifications or contain multiple frames.
+
+If `8841` accepts direct writes but does not return a verified Protocol 02
+frame, the browser automatically writes `SET_CRC_KEY` on that same
+characteristic, switches to the public session key, and retries `GET_VERSION`.
+If the retry is also write-only, the UI retains the session-CRC path as
+`session-registered-unverified`; it does not mistake a successful GATT Promise
+for a verified printer response.
 
 The default P1 print job mirrors the public WebBLE reference as a conservative
 bring-up path: set density separately, send `0x00` raster chunks, then finish
-with `0x1a` using a one-byte feed payload. The browser no longer injects
-`0x22` default-parameter or `0x2c` paper-type frames into the default P1 path
-until those commands are physically confirmed for the connected firmware.
+with `0x1a` using a one-byte feed payload. The browser does not inject `0x22`
+default-parameter or `0x2c` paper-type frames into the P1 path until those
+commands are physically confirmed for the connected firmware. If session CRC
+registration is selected, it changes the CRC seed for subsequent frames but
+does not add unverified setup commands.
 
-The session registration path is explicit and diagnostic-only. Calling
-`registerP1SessionCrc()` writes the public session-key vector:
+### P1 adaptation selector
+
+The Advanced settings panel exposes both the P1 transport adapter and the ATT
+write method. They take effect on the next connection and are included in the
+diagnostic JSON under `p1.adapter` and `p1.writeMode`.
+
+| Adapter | Selection rule | Session CRC |
+| --- | --- | --- |
+| Auto (default) | `8841` first; historical `6DAA` only if `8841` is absent | automatic after a write-only `8841` probe |
+| `8841` session CRC | only `8841` | automatic after a write-only probe |
+| `8841` standard CRC | only `8841` | disabled |
+| Historical `6DAA` | only `6DAA` | disabled |
+| Compatibility sweep | `8841`, other writable candidates, then explicit `6DAA` | automatic on `8841` |
+
+The `6DAA` options are deliberately labelled historical/compatibility modes:
+the ISSC characteristic definition identifies it as connection-parameter
+control, not the transparent printer data channel. They exist to reproduce
+older WebBLE implementations without changing the safe default.
+
+The session-key vector is:
 
 ```text
 0218000400787ace332c8980f003
 ```
 
 and switches subsequent CRCs to the negotiated session key. The browser does
-not call this method automatically.
+this explicitly when the automatic `8841` fallback or a diagnostic action
+selects the session path.
 
 Protocol 02 P1 frames up to 512 bytes are attempted as one GATT write. This is
 important for the 490-byte desktop raster frame: splitting it at the generic
